@@ -3,6 +3,7 @@
  * - Login com cookies
  * - Grid: tenta botões → fallback por TÍTULO com rolagem + XPath + scanner
  * - Aula: Acessar/Avançar → play → 15min → Marcar como estudado → Atividades
+ * - Compatível com Puppeteer recente (usa sleep() em vez de page.waitForTimeout)
  */
 
 import puppeteer from "puppeteer";
@@ -31,6 +32,9 @@ const COURSE_TITLES = (process.env.COURSE_TITLES || "")
 
 /** Local do Chrome baixado no build (Render) */
 const PUP_CACHE = process.env.PUPPETEER_CACHE_DIR || path.join(process.cwd(), ".puppeteer");
+
+/* =============== Utils =============== */
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 /* ================= Cookies opcionais ================= */
 if (COOKIES_BASE64) {
@@ -125,7 +129,7 @@ async function clickAndWaitSPA(page, element, timeout = 10000) {
       return t.includes("minhas disciplinas") || t.includes("continue de onde parou");
     }).catch(() => false);
     if (!stillGrid) return true;
-    await page.waitForTimeout(250);
+    await sleep(250);
   }
   return false;
 }
@@ -179,7 +183,7 @@ async function waitMinimumWatchTime(page, minutes = 15) {
   console.log(`⏳ Aguardando ${minutes} minutos…`);
   while (waited < totalMs) {
     const chunk = Math.min(step, totalMs - waited);
-    await page.waitForTimeout(chunk);
+    await sleep(chunk);
     waited += chunk;
     try { await page.evaluate(() => window.scrollBy(0, 240)); } catch {}
   }
@@ -190,7 +194,7 @@ async function clickPrimaryProgressButtons(page) {
   const keys = ["acessar conteúdo", "avançar", "próximo", "acessar conteudo"];
   const btn = await findElementByText(page, "button, a[role='button']", keys);
   if (!btn) return false;
-  try { await btn.click(); await page.waitForTimeout(800); return true; } catch {}
+  try { await btn.click(); await sleep(800); return true; } catch {}
   return false;
 }
 async function markLessonCompleted(page) {
@@ -205,7 +209,7 @@ async function markLessonCompleted(page) {
         try { await el.click(); console.log("✅ Aula marcada como estudada."); return true; } catch {}
       }
     }
-    await page.waitForTimeout(6000);
+    await sleep(6000);
   }
   console.log("⚠️ Não consegui marcar como estudada (tempo não liberou?).");
   return false;
@@ -214,7 +218,7 @@ async function findAndDoModuleTests(page) {
   console.log("🔎 Procurando testes/atividades…");
   const kws = ["atividade", "teste", "avaliação", "quiz", "prova", "múltipla escolha"];
   const entries = await findAllByText(page, "a, button, div, span", kws);
-  for (const el of entries) { try { await el.click(); await page.waitForTimeout(800); } catch {} }
+  for (const el of entries) { try { await el.click(); await sleep(800); } catch {} }
 
   const blocks = await page.$$(".question, .questao, .q-item, .enunciado, fieldset, .form-group");
   if (blocks.length) {
@@ -236,7 +240,7 @@ async function findAndDoModuleTests(page) {
     }
   }
   const send = await findElementByText(page, "button, a[role='button']", ["responda", "enviar", "finalizar", "submeter", "concluir"]);
-  if (send) { try { await send.click(); await page.waitForTimeout(1000); console.log("✅ Teste/atividade enviado(a)."); } catch {} }
+  if (send) { try { await send.click(); await sleep(1000); console.log("✅ Teste/atividade enviado(a)."); } catch {} }
 }
 
 /* ================== GRID ================== */
@@ -288,20 +292,14 @@ async function getOpenCourseButtons(page) {
 async function openDisciplineByTitle(page, title) {
   await page.goto(COURSE_URL, { waitUntil: "networkidle2" });
 
-  // 0) garantir que a grid carregou algo de conteúdo
-  await page.waitForTimeout(800);
+  // garantir grid carregada
+  await sleep(800);
   await page.evaluate(() => window.scrollTo(0, 0)).catch(() => {});
 
-  // função que tenta localizar e clicar no card/título no contexto da página
   const tryOpen = async () => {
     return page.evaluate((titleIn) => {
       const title = titleIn;
-
-      const norm = (s) => (s || "")
-        .toString()
-        .normalize("NFD")
-        .replace(/\p{Diacritic}/gu, "")
-        .toLowerCase();
+      const norm = (s) => (s || "").toString().normalize("NFD").replace(/\p{Diacritic}/gu, "").toLowerCase();
 
       const isBigBox = (el) => {
         const r = el.getBoundingClientRect();
@@ -322,7 +320,7 @@ async function openDisciplineByTitle(page, title) {
       };
       const click = (el) => { el.scrollIntoView({ block: "center" }); el.click(); return true; };
 
-      // a) XPath/translate sem acento
+      // XPath/translate (remove acentos)
       const AC1 = "ÁÀÂÃÄáàâãäÉÈÊËéèêëÍÌÎÏíìîïÓÒÔÕÖóòôõöÚÙÛÜúùûüÇç";
       const AC2 = "AAAAAaaaaaEEEEeeeeIIIIiiiiOOOOOoooooUUUUuuuuCc";
       const xTitle = `
@@ -341,7 +339,7 @@ async function openDisciplineByTitle(page, title) {
         if (r && (r.width || r.height)) nodes.push(el);
       }
 
-      // b) Scanner por nós de texto (caso XPath falhe em algum shadow/normalize)
+      // Scanner por nós de texto (backup)
       if (!nodes.length) {
         const all = Array.from(document.querySelectorAll("body *")).filter(e => {
           try {
@@ -354,7 +352,7 @@ async function openDisciplineByTitle(page, title) {
       }
       if (!nodes.length) return false;
 
-      // c) Subir ao card e procurar seta
+      // Subir ao card e procurar seta
       const candidates = [];
       for (const el of nodes) {
         let card = el;
@@ -377,7 +375,7 @@ async function openDisciplineByTitle(page, title) {
       // clique no card
       for (const { card } of candidates) return click(card);
 
-      // d) Seta mais próxima do texto
+      // seta mais próxima do texto
       const arrows = Array.from(document.querySelectorAll("button")).filter(isArrowButton);
       if (!arrows.length) return false;
       const dist = (a, b) => {
@@ -398,26 +396,27 @@ async function openDisciplineByTitle(page, title) {
     }, title);
   };
 
-  // 1) esperar o título estar no DOM (sem acentos) — com timeout pequeno
-  const seen = await page.waitForFunction(
+  // Espera o título estar no DOM (sem acentos)
+  await page.waitForFunction(
     (t) => {
       const n = s => s.normalize("NFD").replace(/\p{Diacritic}/gu, "").toLowerCase();
       return n(document.body.innerText || "").includes(n(t));
     },
-    { timeout: 6000 }
-  , title).catch(() => null);
+    { timeout: 6000 },
+    title
+  ).catch(() => null);
 
-  // 2) varredura com rolagem: topo → várias telas para forçar lazy-load/virtualização
-  const maxSteps = 12; // ~6 telas completas
+  // Varredura com rolagem
+  const maxSteps = 12; // ~6 telas
   for (let step = -1; step < maxSteps; step++) {
     if (step === -1) { await page.evaluate(() => window.scrollTo(0, 0)).catch(() => {}); }
     else { await page.evaluate(() => window.scrollBy(0, window.innerHeight / 2)).catch(() => {}); }
 
-    await page.waitForTimeout(350);
+    await sleep(350);
     const opened = await tryOpen();
     if (opened) {
       // aguarda transição SPA
-      const ok = await new Promise(resolve => {
+      const ok = await new Promise(async (resolve) => {
         const oldUrl = page.url();
         const start = Date.now();
         const loop = async () => {
@@ -458,7 +457,7 @@ async function processSingleDiscipline(page, maxItemsPerDiscipline = 5) {
     processed++;
 
     const backBtn = await findElementByText(page, "a, button", ["voltar", "retornar"]);
-    if (backBtn) { try { await backBtn.click(); await page.waitForTimeout(900); } catch {} }
+    if (backBtn) { try { await backBtn.click(); await sleep(900); } catch {} }
     else { try { await gotoHome(page); } catch {} break; }
   }
   console.log(`✅ Itens processados nesta disciplina: ${processed}`);
