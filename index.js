@@ -1,9 +1,8 @@
 /**
- * ESTACIO AGENT — index.js (robusto para grid + SPA)
- * - Varre TODAS as disciplinas (card "Digital (Ead)" e "Continue de onde parou")
- * - Clica no botão circular de seta do card
- * - Dentro da disciplina: Acessar conteúdo/Avançar → play → 15min → Marcar como estudado
- * - Faz atividades/testes e volta ao grid
+ * ESTACIO AGENT — index.js (grid + fallback por título + SPA)
+ * - Procura cards pelo texto “Digital (Ead)”/“Continue de onde parou” e clica no botão circular de seta
+ * - Fallback: se não achar botões, procura o card por TÍTULO (COURSE_TITLES no .env, ex: "Matemática e Lógica")
+ * - Dentro da disciplina: Acessar conteúdo/Avançar → play vídeo → 15min → Marcar como estudado → Atividades/Testes
  */
 
 import puppeteer from "puppeteer";
@@ -24,6 +23,12 @@ const RUN_IMMEDIATELY = process.env.RUN_IMMEDIATELY === "true";
 const CRON_SCHEDULE = process.env.CRON_SCHEDULE || "0 7 * * *";
 const TIMEZONE = process.env.TIMEZONE || "America/Sao_Paulo";
 const HEADLESS = process.env.HEADLESS !== "false";
+
+/** Títulos de disciplinas para fallback (separados por vírgula) */
+const COURSE_TITLES = (process.env.COURSE_TITLES || "")
+  .split(",")
+  .map(s => s.trim())
+  .filter(Boolean);
 
 /** Diretório onde o Chrome foi instalado no build */
 const PUP_CACHE = process.env.PUPPETEER_CACHE_DIR || path.join(process.cwd(), ".puppeteer");
@@ -115,7 +120,7 @@ async function findAllByText(pageOrRoot, selector, keywords) {
 }
 
 /** Clique com suporte a SPA (espera mudar URL OU sair do grid) */
-async function clickAndWaitSPA(page, element, timeout = 9000) {
+async function clickAndWaitSPA(page, element, timeout = 10000) {
   const oldUrl = page.url();
   try { await element.evaluate(el => el.scrollIntoView({ block: "center", inline: "center" })); } catch {}
   await element.click({ delay: 50 });
@@ -200,7 +205,7 @@ async function clickPrimaryProgressButtons(page) {
 }
 
 async function markLessonCompleted(page) {
-  // Botão fica com um timer: “Marcar como estudado (03:11)”
+  // Botão com timer “Marcar como estudado (mm:ss)”
   const key = "marcar como estudado";
   let tries = 20;
   while (tries--) {
@@ -223,13 +228,9 @@ async function findAndDoModuleTests(page) {
   console.log("🔎 Procurando testes/atividades…");
   const kws = ["atividade", "teste", "avaliação", "quiz", "prova", "múltipla escolha"];
 
-  // entrar nas atividades se houver link/botão
   const entries = await findAllByText(page, "a, button, div, span", kws);
   for (const el of entries) {
-    try {
-      await el.click();
-      await page.waitForTimeout(1000);
-    } catch {}
+    try { await el.click(); await page.waitForTimeout(1000); } catch {}
   }
 
   // responder (heurística)
@@ -257,7 +258,6 @@ async function findAndDoModuleTests(page) {
     }
   }
 
-  // botão “Responda”, “Enviar”, “Finalizar”
   const send = await findElementByText(page, "button, a[role='button']", ["responda", "enviar", "finalizar", "submeter", "concluir"]);
   if (send) {
     try { await send.click(); await page.waitForTimeout(1200); console.log("✅ Teste/atividade enviado(a)."); } catch {}
@@ -267,10 +267,7 @@ async function findAndDoModuleTests(page) {
 /* ================== GRID: localizar e abrir disciplinas ================== */
 
 /**
- * Retorna os botões circulares de "seta" dentro de cards.
- * Estratégias:
- *  - procurar containers cujo texto contenha “Digital (Ead)” OU “Continue de onde parou”
- *  - dentro do container, pegar o **último** botão com `svg` e tamanho ≥ 40px
+ * Botões de “seta” dentro de cards.
  */
 async function getOpenCourseButtons(page) {
   const containers = await page.$$("article, section, div");
@@ -288,11 +285,9 @@ async function getOpenCourseButtons(page) {
 
     if (!isCard) continue;
 
-    // pega botões do card
     const btns = await c.$$("button");
     if (!btns.length) continue;
 
-    // filtra por "circular com svg" e tamanho
     const circleCandidates = [];
     for (const b of btns) {
       const ok = await b.evaluate((el) => {
@@ -313,7 +308,6 @@ async function getOpenCourseButtons(page) {
     if (chosen) buttons.push(chosen);
   }
 
-  // de-duplicar por referência
   const uniq = [];
   for (const b of buttons) {
     let dup = false;
@@ -326,6 +320,54 @@ async function getOpenCourseButtons(page) {
   return uniq;
 }
 
+/**
+ * Fallback: encontra o **card** cujo texto contenha um TÍTULO (ex: "Matemática e Lógica"),
+ * e tenta clicar no **botão circular de seta** dentro dele. Se não achar o botão, clica no próprio card.
+ */
+async function openDisciplineByTitle(page, title) {
+  await page.goto(COURSE_URL, { waitUntil: "networkidle2" });
+  const lowerTitle = title.toLowerCase();
+
+  const containers = await page.$$("article, section, div");
+  for (const c of containers) {
+    let isThis = false;
+    try {
+      const txt = (await (await c.getProperty("innerText")).jsonValue() || "").toLowerCase();
+      if (txt.includes(lowerTitle)) isThis = true;
+    } catch {}
+    if (!isThis) continue;
+
+    // dentro do card, prioriza botão circular
+    const btns = await c.$$("button");
+    let arrow = null;
+    for (const b of btns) {
+      const ok = await b.evaluate((el) => {
+        try {
+          const rect = el.getBoundingClientRect();
+          if (!rect || rect.width < 40 || rect.height < 40) return false;
+          const approxSquare = Math.abs(rect.width - rect.height) <= 16;
+          const hasIcon = !!el.querySelector("svg");
+          return approxSquare && hasIcon;
+        } catch { return false; }
+      });
+      if (ok) arrow = b;
+    }
+
+    if (arrow) {
+      const ok = await clickAndWaitSPA(page, arrow, 10000);
+      if (ok) return true;
+    }
+
+    // fallback: clica no card
+    try {
+      await c.evaluate(el => el.scrollIntoView({ block: "center" }));
+      const ok = await clickAndWaitSPA(page, c, 10000);
+      if (ok) return true;
+    } catch {}
+  }
+  return false;
+}
+
 async function gotoHome(page) {
   await page.goto(COURSE_URL, { waitUntil: "networkidle2" });
 }
@@ -334,7 +376,6 @@ async function openDisciplineByIndex(page, idx) {
   await gotoHome(page);
   const btns = await getOpenCourseButtons(page);
   if (!btns.length || idx >= btns.length) {
-    console.log("⚠️ Nenhum botão de abrir disciplina detectado.");
     return false;
   }
   const ok = await clickAndWaitSPA(page, btns[idx], 10000);
@@ -345,29 +386,23 @@ async function openDisciplineByIndex(page, idx) {
 async function processSingleDiscipline(page, maxItemsPerDiscipline = 5) {
   let processed = 0;
   while (processed < maxItemsPerDiscipline) {
-    // tenta “Acessar conteúdo/Avançar”
     await clickPrimaryProgressButtons(page);
 
-    // dá play em vídeo (se existir)
     try {
       await page.evaluate(() => { const v = document.querySelector("video"); if (v) v.play().catch(() => {}); });
     } catch {}
 
-    // se entrou numa página de conteúdo, espera e tenta marcar
     await waitMinimumWatchTime(page, 15);
     await markLessonCompleted(page);
 
-    // procura e executa atividades
     await findAndDoModuleTests(page);
 
     processed += 1;
 
-    // Tenta voltar (se houver “Voltar”)
     const backBtn = await findElementByText(page, "a, button", ["voltar", "retornar"]);
     if (backBtn) {
       try { await backBtn.click(); await page.waitForTimeout(1200); } catch {}
     } else {
-      // ou navega pro grid de novo
       try { await gotoHome(page); } catch {}
       break;
     }
@@ -380,8 +415,25 @@ async function processAllDisciplines(page, maxDisciplines = 12) {
   console.log("🗂  Varredura das disciplinas…");
   await gotoHome(page);
 
-  const btns = await getOpenCourseButtons(page);
-  const total = Math.min(maxDisciplines, btns.length);
+  let btns = await getOpenCourseButtons(page);
+  let total = Math.min(maxDisciplines, btns.length);
+
+  if (!total && COURSE_TITLES.length) {
+    console.log("ℹ️ Nenhum botão detectado — usando fallback por TÍTULO…");
+    // percorre apenas os títulos listados
+    for (const title of COURSE_TITLES) {
+      console.log(`\n=== 🎯 Tentando abrir por título: ${title} ===`);
+      const opened = await openDisciplineByTitle(page, title);
+      if (!opened) {
+        console.log(`↷ Não consegui abrir "${title}". Pulando…`);
+        continue;
+      }
+      try { await processSingleDiscipline(page, 5); } catch (e) { console.warn("⚠️ Erro na disciplina:", e.message); }
+      try { await gotoHome(page); } catch {}
+    }
+    console.log("\n✅ Varredura concluída (fallback por título).");
+    return;
+  }
 
   if (!total) {
     console.log("ℹ️ Nenhum botão de abrir disciplina encontrado no grid.");
@@ -389,7 +441,6 @@ async function processAllDisciplines(page, maxDisciplines = 12) {
   }
 
   console.log(`📦 Detectados ${btns.length} cards • Processando até ${total}.`);
-
   for (let i = 0; i < total; i++) {
     console.log(`\n=== 📚 Disciplina ${i + 1}/${total} ===`);
     const opened = await openDisciplineByIndex(page, i);
@@ -398,12 +449,7 @@ async function processAllDisciplines(page, maxDisciplines = 12) {
       continue;
     }
 
-    try {
-      await processSingleDiscipline(page, 5);
-    } catch (e) {
-      console.warn("⚠️ Erro na disciplina:", e.message);
-    }
-
+    try { await processSingleDiscipline(page, 5); } catch (e) { console.warn("⚠️ Erro na disciplina:", e.message); }
     try { await gotoHome(page); } catch {}
   }
 
