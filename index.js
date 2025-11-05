@@ -1,5 +1,5 @@
 /**
- * ESTACIO AGENT — index.js
+ * ESTACIO AGENT — index.js (sem XPath)
  * - Varre TODAS as disciplinas do grid
  * - Assiste 15min, tenta concluir e faz testes
  * - Compatível com Render (Chrome em .puppeteer)
@@ -91,6 +91,41 @@ async function launchBrowser() {
   });
 }
 
+/* ==================== HELPERS (sem XPath) ==================== */
+
+/** Retorna o primeiro elemento (ElementHandle) cujo texto inclui um dos termos (case-insensitive). */
+async function findElementByText(pageOrRoot, selector, keywords) {
+  const els = await pageOrRoot.$$(selector);
+  for (const el of els) {
+    try {
+      const txt = (await (await el.getProperty("innerText")).jsonValue() || "").toLowerCase();
+      if (keywords.some(k => txt.includes(k.toLowerCase()))) return el;
+    } catch {}
+  }
+  return null;
+}
+
+/** Retorna todos os elementos do selector cujo texto contém algum termo. */
+async function findAllByText(pageOrRoot, selector, keywords) {
+  const out = [];
+  const els = await pageOrRoot.$$(selector);
+  for (const el of els) {
+    try {
+      const txt = (await (await el.getProperty("innerText")).jsonValue() || "").toLowerCase();
+      if (keywords.some(k => txt.includes(k.toLowerCase()))) out.push(el);
+    } catch {}
+  }
+  return out;
+}
+
+/** Clica num botão/link com texto (qualquer um dos termos) */
+async function clickByText(pageOrRoot, selector, keywords) {
+  const el = await findElementByText(pageOrRoot, selector, keywords);
+  if (!el) return false;
+  try { await el.click(); return true; } catch {}
+  return false;
+}
+
 /* ==================== LOGIN ==================== */
 async function ensureLoggedIn(page) {
   // cookies
@@ -149,41 +184,33 @@ async function waitMinimumWatchTime(page, minutes = 15) {
   }
 }
 
-/* ================= Marcar aula concluída ================= */
+/* ================= Marcar aula concluída (sem XPath) ================= */
 async function markLessonCompleted(page) {
-  const xps = [
-    "//button[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'concluir')]",
-    "//button[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'finalizar')]",
-    "//button[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'completo')]"
-  ];
-  for (const xp of xps) {
-    const [btn] = await page.$x(xp);
-    if (btn) {
-      try { await btn.click(); console.log("✅ Aula marcada como concluída."); return true; } catch {}
-    }
+  const keys = ["concluir", "finalizar", "completo", "concluída", "concluido"];
+  // procura botões com esses textos
+  const btn = await findElementByText(page, "button, a[role='button']", keys);
+  if (btn) {
+    try {
+      await btn.click();
+      console.log("✅ Aula marcada como concluída.");
+      return true;
+    } catch {}
   }
   console.log("⚠️ Botão de concluir não encontrado.");
   return false;
 }
 
-/* ================== Testes/Atividades ================== */
+/* ================== Testes/Atividades (sem XPath) ================== */
 async function findAndDoModuleTests(page) {
   console.log("🔎 Procurando testes/atividades…");
   const kws = ["teste", "atividade", "avaliação", "quiz", "prova", "múltipla escolha"];
-  const els = await page.$$("a, button, div, span");
-  const targets = [];
 
-  for (const el of els) {
-    try {
-      const txt = (await (await el.getProperty("innerText")).jsonValue() || "").toLowerCase();
-      if (kws.some(k => txt.includes(k))) targets.push(el);
-    } catch {}
-  }
+  // coleta candidatos pelo texto
+  const candidates = await findAllByText(page, "a, button, div, span", kws);
+  if (!candidates.length) { console.log("ℹ️ Nenhuma atividade encontrada."); return; }
+  console.log(`📌 ${candidates.length} atividade(s) encontrada(s).`);
 
-  if (!targets.length) { console.log("ℹ️ Nenhuma atividade encontrada."); return; }
-  console.log(`📌 ${targets.length} atividade(s) encontrada(s).`);
-
-  for (const el of targets) {
+  for (const el of candidates) {
     try {
       await el.click();
       await page.waitForTimeout(1200);
@@ -192,7 +219,7 @@ async function findAndDoModuleTests(page) {
       const blocks = await page.$$(".question, .questao, .q-item, .enunciado, fieldset, .form-group");
       if (blocks.length) {
         for (const b of blocks) {
-          const opts = await b.$$("label, .option, .alternativa, .answer");
+          const opts = await b.$$("label, .option, .alternativa, .answer, input[type='radio'] + label");
           if (opts.length) {
             const pick = Math.floor(Math.random() * opts.length);
             try { await opts[pick].click(); } catch {}
@@ -213,23 +240,11 @@ async function findAndDoModuleTests(page) {
         }
       }
 
-      // enviar
-      const submitXps = [
-        "//button[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'enviar')]",
-        "//button[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'finalizar')]",
-        "//button[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'submeter')]",
-        "//button[@type='submit']"
-      ];
-      for (const xp of submitXps) {
-        const [btn] = await page.$x(xp);
-        if (btn) {
-          await Promise.all([
-            page.waitForNavigation({ waitUntil: "networkidle2", timeout: 15000 }).catch(() => {}),
-            btn.click().catch(() => {})
-          ]);
-          console.log("✅ Teste enviado.");
-          break;
-        }
+      // enviar (busca por texto)
+      const sent = await clickByText(page, "button, a[role='button']", ["enviar", "finalizar", "submeter", "concluir"]);
+      if (sent) {
+        try { await page.waitForNavigation({ waitUntil: "networkidle2", timeout: 15000 }); } catch {}
+        console.log("✅ Teste enviado.");
       }
     } catch (e) {
       console.warn("⚠️ Erro ao processar atividade:", e.message);
@@ -237,12 +252,12 @@ async function findAndDoModuleTests(page) {
   }
 }
 
-/* ================== Navegação por disciplinas ================== */
+/* ================== Navegação por disciplinas (sem XPath) ================== */
 async function gotoHome(page) {
   await page.goto(COURSE_URL, { waitUntil: "networkidle2" });
 }
 
-/** Detecta e retorna ElementHandles dos cards do grid */
+/** Tenta detectar os "cards" do grid de disciplinas */
 async function getCourseCards(page) {
   // Estratégia A: cards típicos
   let cards = await page.$$(
@@ -250,17 +265,26 @@ async function getCourseCards(page) {
   );
   if (cards.length) return cards;
 
-  // Estratégia B (XPath): bloco com “Digital (Ead)” e pelo menos um botão
-  const xpathB = "//*[contains(normalize-space(.), 'Digital (Ead)') and .//button]";
-  cards = await page.$x(xpathB);
-  if (cards.length) return cards;
+  // Estratégia B: qualquer bloco com texto "Digital (Ead)" e botão dentro
+  const allBlocks = await page.$$("article, section, div");
+  const result = [];
+  for (const blk of allBlocks) {
+    try {
+      const txt = (await (await blk.getProperty("innerText")).jsonValue() || "").toLowerCase();
+      if (!txt) continue;
+      if (!txt.includes("digital (ead)")) continue;
+      const hasButton = !!(await blk.$("button"));
+      if (hasButton) result.push(blk);
+    } catch {}
+  }
+  if (result.length) return result;
 
-  // Estratégia C: derivar container a partir dos botões (pega o “card” pai)
+  // Estratégia C: derive contêiner a partir de botões (pega "card" pai)
   const buttons = await page.$$("button");
-  const containerHandles = [];
+  const containers = [];
   for (const btn of buttons) {
     try {
-      const container = await btn.evaluateHandle((el) => {
+      const handle = await btn.evaluateHandle((el) => {
         function findCard(node) {
           while (node && node !== document.body) {
             const cls = (node.getAttribute && node.getAttribute("class")) || "";
@@ -276,15 +300,14 @@ async function getCourseCards(page) {
         }
         return findCard(el);
       });
-      if (container) containerHandles.push(container);
+      if (handle) containers.push(handle);
     } catch {}
   }
-  // Remover duplicados (por referência real)
+  // Dedup
   const uniq = [];
-  for (const h of containerHandles) {
+  for (const h of containers) {
     let isDup = false;
     for (const u of uniq) {
-      // compara o elemento do DOM
       /* eslint-disable no-await-in-loop */
       const [a, b] = await Promise.all([u.evaluate(n => n), h.evaluate(n => n)]).catch(() => [null, null]);
       if (a === b) { isDup = true; break; }
@@ -292,15 +315,10 @@ async function getCourseCards(page) {
     }
     if (!isDup) uniq.push(h);
   }
-  if (uniq.length) return uniq;
-
-  // Estratégia D: bloco que tenha botão e porcentagem ou "0/"
-  const xpathD = "//*[.//button and (contains(., '%') or contains(., '0/'))]";
-  cards = await page.$x(xpathD);
-  return cards;
+  return uniq;
 }
 
-/** Abre a disciplina do grid pelo índice (clicando no “botão de setinha” do card) */
+/** Abre a disciplina do grid pelo índice (clicando normalmente no último botão do card) */
 async function openCourseByIndex(page, courseIndex) {
   await gotoHome(page);
   const cards = await getCourseCards(page);
@@ -312,7 +330,20 @@ async function openCourseByIndex(page, courseIndex) {
 
   const card = cards[courseIndex];
 
-  // Heurística: dentro do card, clique no **último botão** (normalmente é a setinha).
+  // pular 100%
+  try {
+    const percentEl = await findElementByText(card, "div, span", ["%"]);
+    if (percentEl) {
+      const txt = (await (await percentEl.getProperty("innerText")).jsonValue() || "").trim();
+      const m = txt.match(/(\d{1,3})\s*%/);
+      if (m && Number(m[1]) >= 100) {
+        console.log(`↷ Pulando disciplina ${courseIndex + 1} (100%).`);
+        return false;
+      }
+    }
+  } catch {}
+
+  // Heurística: clique no **último botão** do card (a setinha)
   try {
     const innerButtons = await card.$$("button");
     if (innerButtons.length) {
@@ -325,7 +356,7 @@ async function openCourseByIndex(page, courseIndex) {
     }
   } catch {}
 
-  // fallback: clicar em algum link do card
+  // fallback: link do card
   try {
     const link = await card.$("a[href]");
     if (link) {
@@ -354,7 +385,7 @@ async function processSingleDiscipline(page, maxItemsPerDiscipline = 5) {
   while (processed < maxItemsPerDiscipline) {
     // localizar uma aula/conteúdo
     let lessonHref = null;
-    const anchors = await page.$$("a");
+    const anchors = await page.$$("a[href]");
     for (const a of anchors) {
       const href = await a.evaluate(el => el.getAttribute("href"));
       if (!href) continue;
