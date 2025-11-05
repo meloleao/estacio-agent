@@ -1,24 +1,23 @@
-// index.js — Background Worker (Render pago)
-// - Chrome via puppeteer.executablePath() (obrigatório no Render)
-// - Cron diário + execução imediata opcional
-// - Assiste 15min, tenta marcar concluído e processa testes
-
+// index.js — Background Worker (Render)
+// Correções: resolução dinâmica do caminho do Chrome + fallback
 import puppeteer from "puppeteer";
 import cron from "node-cron";
 import fs from "fs";
+import path from "path";
 import dotenv from "dotenv";
 
 dotenv.config();
 
-/* ====== ENV VARS ====== */
+/* ====== ENV ====== */
 const EMAIL = process.env.ESTACIO_EMAIL;
 const SENHA = process.env.ESTACIO_SENHA;
 const COURSE_URL = process.env.COURSE_URL || "https://estudante.estacio.br/disciplinas";
-const COOKIES_BASE64 = process.env.COOKIES_BASE64 || null; // opcional
+const COOKIES_BASE64 = process.env.COOKIES_BASE64 || null;
 const RUN_IMMEDIATELY = process.env.RUN_IMMEDIATELY === "true";
-const CRON_SCHEDULE = process.env.CRON_SCHEDULE || "0 7 * * *"; // 07:00 todos os dias
+const CRON_SCHEDULE = process.env.CRON_SCHEDULE || "0 7 * * *";
 const TIMEZONE = process.env.TIMEZONE || "America/Sao_Paulo";
 const HEADLESS = process.env.HEADLESS !== "false";
+const PUP_CACHE = process.env.PUPPETEER_CACHE_DIR || "/opt/render/.cache/puppeteer";
 
 /* ====== COOKIES (opcional) ====== */
 if (COOKIES_BASE64) {
@@ -27,30 +26,65 @@ if (COOKIES_BASE64) {
     fs.writeFileSync("./cookies.json", buff);
     console.log("✅ cookies.json criado a partir de COOKIES_BASE64.");
   } catch (e) {
-    console.warn("⚠️ Falha ao criar cookies.json a partir de COOKIES_BASE64:", e.message);
+    console.warn("⚠️ Falha ao gravar cookies.json:", e.message);
   }
 }
 
-/* ====== BROWSER ====== */
+/* ====== Chrome path resolver ====== */
+function findChromeInCache(cacheDir = PUP_CACHE) {
+  try {
+    if (!fs.existsSync(cacheDir)) return null;
+    // procura .../chrome/linux-xxx/chrome
+    const chromeRoot = path.join(cacheDir, "chrome");
+    if (!fs.existsSync(chromeRoot)) return null;
+
+    const platforms = fs.readdirSync(chromeRoot); // ex: ['linux-131.0.6778.204']
+    for (const plat of platforms) {
+      const candidate = path.join(chromeRoot, plat, "chrome-linux64", "chrome");
+      const candidate2 = path.join(chromeRoot, plat, "chrome-linux", "chrome");
+      if (fs.existsSync(candidate)) return candidate;
+      if (fs.existsSync(candidate2)) return candidate2;
+    }
+  } catch {}
+  return null;
+}
+
+function resolveChromePath() {
+  // 1) valor que o Puppeteer expõe
+  try {
+    const p = puppeteer.executablePath();
+    if (p && fs.existsSync(p)) return p;
+  } catch {}
+  // 2) procurar no cache padrão do Render
+  const fromCache = findChromeInCache(PUP_CACHE);
+  if (fromCache) return fromCache;
+  // 3) possíveis binários do sistema
+  const guesses = ["/usr/bin/google-chrome", "/usr/bin/chromium-browser", "/usr/bin/chromium"];
+  for (const g of guesses) if (fs.existsSync(g)) return g;
+  // 4) como último recurso, deixa o Puppeteer decidir
+  return undefined;
+}
+
+/* ====== Browser ====== */
 async function launchBrowser() {
+  const execPath = resolveChromePath();
+  console.log("🧭 Chrome path:", execPath || "(default by Puppeteer)");
   return await puppeteer.launch({
     headless: HEADLESS,
-    executablePath: puppeteer.executablePath(), // ESSENCIAL no Render
+    executablePath: execPath, // pode ser undefined (Puppeteer decide)
     args: [
       "--no-sandbox",
       "--disable-setuid-sandbox",
       "--disable-dev-shm-usage",
       "--disable-gpu",
       "--no-zygote",
-      "--no-first-run",
-      "--single-process"
+      "--no-first-run"
     ]
   });
 }
 
-/* ====== LOGIN ====== */
+/* ====== Login ====== */
 async function ensureLoggedIn(page) {
-  // usa cookies se existirem
   try {
     if (fs.existsSync("./cookies.json")) {
       const cookies = JSON.parse(fs.readFileSync("./cookies.json", "utf8"));
@@ -59,53 +93,41 @@ async function ensureLoggedIn(page) {
         console.log("✅ Cookies carregados.");
       }
     }
-  } catch (e) {
-    console.warn("⚠️ Erro ao carregar cookies:", e.message);
-  }
+  } catch (e) { console.warn("⚠️ Erro ao carregar cookies:", e.message); }
 
   await page.goto(COURSE_URL, { waitUntil: "domcontentloaded" });
-  if (!page.url().includes("login")) {
-    console.log("✅ Sessão já autenticada.");
-    return;
-  }
+  if (!page.url().includes("login")) { console.log("✅ Sessão autenticada."); return; }
 
-  if (!EMAIL || !SENHA) {
-    console.error("❌ Sem credenciais e sem sessão ativa.");
-    throw new Error("Credenciais ausentes");
-  }
+  if (!EMAIL || !SENHA) throw new Error("Credenciais ausentes");
 
-  console.log("🔑 Fazendo login por credenciais…");
+  console.log("🔑 Fazendo login…");
   await page.goto("https://estudante.estacio.br", { waitUntil: "domcontentloaded" });
-
-  await page.waitForSelector("input[type='email'], input#email, input[name='email']", { timeout: 12000 });
+  await page.waitForSelector("input[type='email'], input#email, input[name='email']", { timeout: 15000 });
   await page.type("input[type='email'], input#email, input[name='email']", EMAIL, { delay: 40 });
   await page.type("input[type='password'], input[name='password'], input[name='senha']", SENHA, { delay: 40 });
-
   await Promise.all([
-    page.waitForNavigation({ waitUntil: "networkidle2", timeout: 25000 }).catch(() => {}),
+    page.waitForNavigation({ waitUntil: "networkidle2", timeout: 30000 }).catch(() => {}),
     page.click("button[type='submit']").catch(() => {})
   ]);
 
-  // salva cookies
   try {
     const cookies = await page.cookies();
     fs.writeFileSync("./cookies.json", JSON.stringify(cookies, null, 2));
     console.log("✅ Cookies salvos.");
-  } catch (e) {
-    console.warn("⚠️ Falha ao salvar cookies:", e.message);
-  }
+  } catch (e) { console.warn("⚠️ Falha ao salvar cookies:", e.message); }
 }
 
-/* ====== AULA: assistir 15min e marcar concluída ====== */
+/* ====== Aula ====== */
 async function waitMinimumWatchTime(page, minutes = 15) {
   const ms = minutes * 60 * 1000;
   const step = 30 * 1000;
   let waited = 0;
   console.log(`⏳ Aguardando ${minutes} minutos…`);
   while (waited < ms) {
-    await page.waitForTimeout(Math.min(step, ms - waited));
+    const chunk = Math.min(step, ms - waited);
+    await page.waitForTimeout(chunk);
+    waited += chunk;
     try { await page.evaluate(() => window.scrollBy(0, 200)); } catch {}
-    waited += Math.min(step, ms - waited);
   }
 }
 
@@ -125,32 +147,29 @@ async function markLessonCompleted(page) {
   return false;
 }
 
-/* ====== TESTES: localizar e submeter ====== */
+/* ====== Testes ====== */
 async function findAndDoModuleTests(page) {
   console.log("🔎 Buscando testes/atividades…");
   const kws = ["teste", "atividade", "avaliação", "quiz", "prova", "múltipla escolha"];
   const els = await page.$$("a, button, div, span");
   const targets = [];
-
   for (const el of els) {
     try {
       const txt = (await (await el.getProperty("innerText")).jsonValue() || "").toLowerCase();
       if (kws.some(k => txt.includes(k))) targets.push(el);
     } catch {}
   }
-
   if (targets.length === 0) { console.log("ℹ️ Nenhuma atividade encontrada."); return; }
-  console.log(`📌 ${targets.length} atividade(s) encontrada(s).`);
 
+  console.log(`📌 ${targets.length} atividade(s) encontrada(s).`);
   for (const el of targets) {
     try {
       await el.click();
       await page.waitForTimeout(1500);
 
-      // responder perguntas (heurística simples)
-      const questionBlocks = await page.$$(".question, .questao, .q-item, .enunciado, fieldset, .form-group");
-      if (questionBlocks.length) {
-        for (const qb of questionBlocks) {
+      const blocks = await page.$$(".question, .questao, .q-item, .enunciado, fieldset, .form-group");
+      if (blocks.length) {
+        for (const qb of blocks) {
           const labels = await qb.$$("label, .option, .alternativa, .answer");
           if (labels.length) {
             const pick = Math.floor(Math.random() * labels.length);
@@ -158,7 +177,6 @@ async function findAndDoModuleTests(page) {
           }
         }
       } else {
-        // fallback por radios
         const radios = await page.$$("input[type='radio']");
         const byName = {};
         for (const r of radios) {
@@ -173,7 +191,6 @@ async function findAndDoModuleTests(page) {
         }
       }
 
-      // submeter
       const submitXps = [
         "//button[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'enviar')]",
         "//button[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'finalizar')]",
@@ -194,10 +211,9 @@ async function findAndDoModuleTests(page) {
       }
       console.log(submitted ? "✅ Teste enviado." : "⚠️ Não foi possível enviar o teste.");
 
-      // screenshot
       try {
         const ts = new Date().toISOString().replace(/[:.]/g, "-");
-        await page.screenshot({ path: `./testshot_${ts}.png`, fullPage: false });
+        await page.screenshot({ path: `./testshot_${ts}.png` });
       } catch {}
     } catch (e) {
       console.warn("⚠️ Erro ao processar atividade:", e.message);
@@ -205,7 +221,7 @@ async function findAndDoModuleTests(page) {
   }
 }
 
-/* ====== EXECUÇÃO ÚNICA ====== */
+/* ====== Execução ====== */
 async function processCourseOnce() {
   console.log("=== Início de execução:", new Date().toLocaleString("pt-BR", { timeZone: TIMEZONE }), "===");
   const browser = await launchBrowser();
@@ -214,10 +230,9 @@ async function processCourseOnce() {
   try {
     await ensureLoggedIn(page);
 
-    // ir para página principal de disciplinas
     await page.goto(COURSE_URL, { waitUntil: "networkidle2" });
 
-    // encontrar link de aula/conteúdo
+    // achar link de aula
     let lessonHref = null;
     const anchors = await page.$$("a");
     for (const a of anchors) {
@@ -229,35 +244,21 @@ async function processCourseOnce() {
         break;
       }
     }
+    if (!lessonHref) { console.log("ℹ️ Nenhuma aula encontrada."); await browser.close(); return; }
 
-    if (!lessonHref) { console.log("ℹ️ Nenhuma aula encontrada nesta execução."); await browser.close(); return; }
-
-    // abre aula
     console.log("🔗 Abrindo aula:", lessonHref);
     await page.goto(lessonHref, { waitUntil: "networkidle2" });
 
-    // tenta iniciar vídeo (se houver)
     try {
-      await page.evaluate(() => {
-        const v = document.querySelector("video");
-        if (v) v.play().catch(() => {});
-      });
+      await page.evaluate(() => { const v = document.querySelector("video"); if (v) v.play().catch(() => {}); });
     } catch {}
 
-    // assiste 15min
     await waitMinimumWatchTime(page, 15);
-
-    // marcar concluída
     await markLessonCompleted(page);
-
-    // processar testes do módulo
     await findAndDoModuleTests(page);
 
-    // screenshot final (opcional)
-    try {
-      const ts = new Date().toISOString().replace(/[:.]/g, "-");
-      await page.screenshot({ path: `./screenshot_${ts}.png` });
-    } catch {}
+    try { const ts = new Date().toISOString().replace(/[:.]/g, "-"); await page.screenshot({ path: `./screenshot_${ts}.png` }); } catch {}
+
   } catch (e) {
     console.error("❌ Erro durante execução:", e.message);
   }
@@ -266,16 +267,16 @@ async function processCourseOnce() {
   console.log("=== Fim de execução ===");
 }
 
-/* ====== SCHEDULER ====== */
+/* ====== Scheduler ====== */
 function startScheduler() {
-  console.log(`🔁 Agendando com CRON "${CRON_SCHEDULE}" (tz: ${TIMEZONE}).`);
+  console.log(`🔁 CRON "${CRON_SCHEDULE}" (tz: ${TIMEZONE}).`);
   cron.schedule(CRON_SCHEDULE, async () => {
     try { await processCourseOnce(); }
     catch (e) { console.error("❌ Execução agendada falhou:", e.message); }
   }, { timezone: TIMEZONE });
 }
 
-/* ====== MAIN ====== */
+/* ====== Main ====== */
 (async () => {
   if (RUN_IMMEDIATELY) {
     console.log("⚡ RUN_IMMEDIATELY=true → executando agora…");
