@@ -1,6 +1,7 @@
 /**
- * ESTACIO AGENT — index.js (sem XPath)
+ * ESTACIO AGENT — index.js (sem XPath + SPA-safe)
  * - Varre TODAS as disciplinas do grid
+ * - Abre cada card clicando no botão circular de "seta"
  * - Assiste 15min, tenta concluir e faz testes
  * - Compatível com Render (Chrome em .puppeteer)
  */
@@ -93,7 +94,7 @@ async function launchBrowser() {
 
 /* ==================== HELPERS (sem XPath) ==================== */
 
-/** Retorna o primeiro elemento (ElementHandle) cujo texto inclui um dos termos (case-insensitive). */
+/** Primeiro elemento cujo texto inclui um dos termos (case-insensitive). */
 async function findElementByText(pageOrRoot, selector, keywords) {
   const els = await pageOrRoot.$$(selector);
   for (const el of els) {
@@ -105,7 +106,7 @@ async function findElementByText(pageOrRoot, selector, keywords) {
   return null;
 }
 
-/** Retorna todos os elementos do selector cujo texto contém algum termo. */
+/** Todos os elementos do selector cujo texto contém algum termo. */
 async function findAllByText(pageOrRoot, selector, keywords) {
   const out = [];
   const els = await pageOrRoot.$$(selector);
@@ -118,11 +119,26 @@ async function findAllByText(pageOrRoot, selector, keywords) {
   return out;
 }
 
-/** Clica num botão/link com texto (qualquer um dos termos) */
-async function clickByText(pageOrRoot, selector, keywords) {
-  const el = await findElementByText(pageOrRoot, selector, keywords);
-  if (!el) return false;
-  try { await el.click(); return true; } catch {}
+/** Clique com suporte a SPA: tenta detectar mudança de URL OU sumiço do texto “Minhas Disciplinas”. */
+async function clickAndWaitSPA(page, element, timeout = 8000) {
+  const oldUrl = page.url();
+  try { await element.evaluate(el => el.scrollIntoView({ block: "center", inline: "center" })); } catch {}
+  await element.click({ delay: 40 });
+
+  const start = Date.now();
+  while (Date.now() - start < timeout) {
+    const urlChanged = page.url() !== oldUrl;
+    if (urlChanged) return true;
+
+    // se a página é SPA, a URL pode não mudar — nesse caso esperamos o texto de cabeçalho desaparecer
+    const stillOnGrid = await page.evaluate(() => {
+      const text = (document.body.innerText || "").toLowerCase();
+      return text.includes("minhas disciplinas");
+    }).catch(() => false);
+
+    if (!stillOnGrid) return true;
+    await page.waitForTimeout(300);
+  }
   return false;
 }
 
@@ -180,14 +196,13 @@ async function waitMinimumWatchTime(page, minutes = 15) {
     const chunk = Math.min(step, totalMs - waited);
     await page.waitForTimeout(chunk);
     waited += chunk;
-    try { await page.evaluate(() => window.scrollBy(0, 200)); } catch {}
+    try { await page.evaluate(() => window.scrollBy(0, 240)); } catch {}
   }
 }
 
 /* ================= Marcar aula concluída (sem XPath) ================= */
 async function markLessonCompleted(page) {
   const keys = ["concluir", "finalizar", "completo", "concluída", "concluido"];
-  // procura botões com esses textos
   const btn = await findElementByText(page, "button, a[role='button']", keys);
   if (btn) {
     try {
@@ -205,7 +220,6 @@ async function findAndDoModuleTests(page) {
   console.log("🔎 Procurando testes/atividades…");
   const kws = ["teste", "atividade", "avaliação", "quiz", "prova", "múltipla escolha"];
 
-  // coleta candidatos pelo texto
   const candidates = await findAllByText(page, "a, button, div, span", kws);
   if (!candidates.length) { console.log("ℹ️ Nenhuma atividade encontrada."); return; }
   console.log(`📌 ${candidates.length} atividade(s) encontrada(s).`);
@@ -241,10 +255,13 @@ async function findAndDoModuleTests(page) {
       }
 
       // enviar (busca por texto)
-      const sent = await clickByText(page, "button, a[role='button']", ["enviar", "finalizar", "submeter", "concluir"]);
+      const sent = await findElementByText(page, "button, a[role='button']", ["enviar", "finalizar", "submeter", "concluir"]);
       if (sent) {
-        try { await page.waitForNavigation({ waitUntil: "networkidle2", timeout: 15000 }); } catch {}
-        console.log("✅ Teste enviado.");
+        try {
+          await sent.click();
+          await page.waitForTimeout(1500);
+          console.log("✅ Teste enviado.");
+        } catch {}
       }
     } catch (e) {
       console.warn("⚠️ Erro ao processar atividade:", e.message);
@@ -252,134 +269,66 @@ async function findAndDoModuleTests(page) {
   }
 }
 
-/* ================== Navegação por disciplinas (sem XPath) ================== */
+/* ================== Grid → encontrar e abrir cada disciplina ================== */
+
+/**
+ * Retorna os botões circulares de "seta" presentes em cada card de disciplina.
+ * Heurísticas:
+ *  - botão dentro de um container que tenha porcentagem (%) ou “x/y”
+ *  - botão aproximadamente quadrado (circular) e com SVG
+ *  - tamanho entre 32 e 80px (para filtrar botões pequenos)
+ */
+async function getOpenCourseButtons(page) {
+  const btns = await page.$$("button");
+  const out = [];
+
+  for (const b of btns) {
+    const ok = await b.evaluate((el) => {
+      try {
+        const rect = el.getBoundingClientRect();
+        if (!rect || !rect.width || !rect.height) return false;
+        const approxSquare = Math.abs(rect.width - rect.height) <= 14;
+        if (!approxSquare) return false;
+        if (rect.width < 32 || rect.width > 80) return false;
+
+        const hasIcon = !!el.querySelector("svg");
+        // sobe no DOM procurando um "card" com % ou x/y
+        let node = el;
+        let score = 0;
+        while (node && node !== document.body) {
+          const txt = (node.innerText || "").toLowerCase();
+          if (/%/.test(txt) || /\d+\s*\/\s*\d+/.test(txt)) { score++; break; }
+          node = node.parentElement;
+        }
+        return hasIcon && score > 0;
+      } catch { return false; }
+    });
+    if (ok) out.push(b);
+  }
+  return out;
+}
+
 async function gotoHome(page) {
   await page.goto(COURSE_URL, { waitUntil: "networkidle2" });
 }
 
-/** Tenta detectar os "cards" do grid de disciplinas */
-async function getCourseCards(page) {
-  // Estratégia A: cards típicos
-  let cards = await page.$$(
-    "article, div[class*='card']:not([class*='small']), div[data-testid*='card']"
-  );
-  if (cards.length) return cards;
-
-  // Estratégia B: qualquer bloco com texto "Digital (Ead)" e botão dentro
-  const allBlocks = await page.$$("article, section, div");
-  const result = [];
-  for (const blk of allBlocks) {
-    try {
-      const txt = (await (await blk.getProperty("innerText")).jsonValue() || "").toLowerCase();
-      if (!txt) continue;
-      if (!txt.includes("digital (ead)")) continue;
-      const hasButton = !!(await blk.$("button"));
-      if (hasButton) result.push(blk);
-    } catch {}
-  }
-  if (result.length) return result;
-
-  // Estratégia C: derive contêiner a partir de botões (pega "card" pai)
-  const buttons = await page.$$("button");
-  const containers = [];
-  for (const btn of buttons) {
-    try {
-      const handle = await btn.evaluateHandle((el) => {
-        function findCard(node) {
-          while (node && node !== document.body) {
-            const cls = (node.getAttribute && node.getAttribute("class")) || "";
-            const text = (node.innerText || "").toLowerCase();
-            const hasProgress = /(\d+\s*\/\s*\d+)/.test(text) || text.includes("%");
-            const maybeCard =
-              node.tagName === "ARTICLE" ||
-              (cls && /card|mui|paper|container|content|grid/i.test(cls));
-            if (maybeCard && hasProgress) return node;
-            node = node.parentElement;
-          }
-          return null;
-        }
-        return findCard(el);
-      });
-      if (handle) containers.push(handle);
-    } catch {}
-  }
-  // Dedup
-  const uniq = [];
-  for (const h of containers) {
-    let isDup = false;
-    for (const u of uniq) {
-      /* eslint-disable no-await-in-loop */
-      const [a, b] = await Promise.all([u.evaluate(n => n), h.evaluate(n => n)]).catch(() => [null, null]);
-      if (a === b) { isDup = true; break; }
-      /* eslint-enable */
-    }
-    if (!isDup) uniq.push(h);
-  }
-  return uniq;
-}
-
-/** Abre a disciplina do grid pelo índice (clicando normalmente no último botão do card) */
-async function openCourseByIndex(page, courseIndex) {
+/** Abre uma disciplina clicando no N-ésimo botão de “seta” detectado no grid. */
+async function openDisciplineByButtonIndex(page, idx) {
   await gotoHome(page);
-  const cards = await getCourseCards(page);
-
-  if (!cards.length || courseIndex >= cards.length) {
-    console.log("⚠️ Nenhum card detectado ou índice fora do range.");
+  const btns = await getOpenCourseButtons(page);
+  if (!btns.length || idx >= btns.length) {
+    console.log("⚠️ Nenhum botão de abrir disciplina detectado.");
     return false;
   }
 
-  const card = cards[courseIndex];
+  const btn = btns[idx];
 
-  // pular 100%
-  try {
-    const percentEl = await findElementByText(card, "div, span", ["%"]);
-    if (percentEl) {
-      const txt = (await (await percentEl.getProperty("innerText")).jsonValue() || "").trim();
-      const m = txt.match(/(\d{1,3})\s*%/);
-      if (m && Number(m[1]) >= 100) {
-        console.log(`↷ Pulando disciplina ${courseIndex + 1} (100%).`);
-        return false;
-      }
-    }
-  } catch {}
-
-  // Heurística: clique no **último botão** do card (a setinha)
-  try {
-    const innerButtons = await card.$$("button");
-    if (innerButtons.length) {
-      const btn = innerButtons[innerButtons.length - 1];
-      await Promise.all([
-        page.waitForNavigation({ waitUntil: "networkidle2" }).catch(() => {}),
-        btn.click(),
-      ]);
-      return true;
-    }
-  } catch {}
-
-  // fallback: link do card
-  try {
-    const link = await card.$("a[href]");
-    if (link) {
-      await Promise.all([
-        page.waitForNavigation({ waitUntil: "networkidle2" }).catch(() => {}),
-        link.click(),
-      ]);
-      return true;
-    }
-  } catch {}
-
-  // último fallback: clicar no próprio card
-  try {
-    await Promise.all([
-      page.waitForNavigation({ waitUntil: "networkidle2" }).catch(() => {}),
-      card.click(),
-    ]);
-    return true;
-  } catch {}
-
-  return false;
+  // evita clicar no "i" (informações) — normalmente o "i" é pequeno e não passa nas heurísticas
+  const ok = await clickAndWaitSPA(page, btn, 9000);
+  return ok;
 }
 
+/* ================== Processar disciplina ================== */
 async function processSingleDiscipline(page, maxItemsPerDiscipline = 5) {
   let processed = 0;
   while (processed < maxItemsPerDiscipline) {
@@ -420,25 +369,26 @@ async function processSingleDiscipline(page, maxItemsPerDiscipline = 5) {
   console.log(`✅ Itens processados nesta disciplina: ${processed}`);
 }
 
+/* ================== Orquestrador: processar TODAS ================== */
 async function processAllDisciplines(page, maxDisciplines = 12) {
   console.log("🗂  Varredura das disciplinas…");
   await gotoHome(page);
 
-  const cards = await getCourseCards(page);
-  const total = Math.min(maxDisciplines, cards.length);
+  const btns = await getOpenCourseButtons(page);
+  const total = Math.min(maxDisciplines, btns.length);
 
   if (!total) {
-    console.log("ℹ️ Nenhuma disciplina no grid (pelos seletores atuais).");
+    console.log("ℹ️ Nenhum botão de abrir disciplina encontrado no grid.");
     return;
   }
 
-  console.log(`📦 Detectados ${cards.length} cards • Processando até ${total}.`);
+  console.log(`📦 Detectados ${btns.length} cards • Processando até ${total}.`);
 
   for (let i = 0; i < total; i++) {
     console.log(`\n=== 📚 Disciplina ${i + 1}/${total} ===`);
-    const opened = await openCourseByIndex(page, i);
+    const opened = await openDisciplineByButtonIndex(page, i);
     if (!opened) {
-      console.log(`↷ Não consegui abrir a disciplina ${i + 1}. Pulando…`);
+      console.log(`↷ Clique não abriu a disciplina ${i + 1}. Pulando…`);
       continue;
     }
 
