@@ -1,6 +1,8 @@
 /**
  * ESTACIO AGENT — index.js
- * Versão totalmente corrigida com detecção automática do Chrome no Render.
+ * - Varre TODAS as disciplinas do grid
+ * - Assiste 15min, tenta concluir e faz testes
+ * - Compatível com Render (Chrome em .puppeteer)
  */
 
 import puppeteer from "puppeteer";
@@ -11,9 +13,7 @@ import dotenv from "dotenv";
 
 dotenv.config();
 
-/* ============================================================
-   ENV
-============================================================ */
+/* ==================== ENV ==================== */
 const EMAIL = process.env.ESTACIO_EMAIL;
 const SENHA = process.env.ESTACIO_SENHA;
 const COURSE_URL = process.env.COURSE_URL || "https://estudante.estacio.br/disciplinas";
@@ -24,14 +24,10 @@ const CRON_SCHEDULE = process.env.CRON_SCHEDULE || "0 7 * * *";
 const TIMEZONE = process.env.TIMEZONE || "America/Sao_Paulo";
 const HEADLESS = process.env.HEADLESS !== "false";
 
-/* Diretório onde o Chrome foi instalado no Build */
-const PUP_CACHE =
-  process.env.PUPPETEER_CACHE_DIR ||
-  path.join(process.cwd(), ".puppeteer");
+/** Diretório onde o Chrome foi instalado no build */
+const PUP_CACHE = process.env.PUPPETEER_CACHE_DIR || path.join(process.cwd(), ".puppeteer");
 
-/* ============================================================
-   COOKIES (opcional)
-============================================================ */
+/* ================= Cookies opcionais ================= */
 if (COOKIES_BASE64) {
   try {
     const buff = Buffer.from(COOKIES_BASE64, "base64");
@@ -42,74 +38,45 @@ if (COOKIES_BASE64) {
   }
 }
 
-/* ============================================================
-   FUNÇÃO: varredor recursivo para encontrar o binário "chrome"
-============================================================ */
+/* ============= Chrome path resolver (Render) ============= */
 function findChromeBinary(startDir) {
   try {
     const stack = [startDir];
-
     while (stack.length) {
       const dir = stack.pop();
-
       if (!dir || !fs.existsSync(dir)) continue;
-
       const entries = fs.readdirSync(dir, { withFileTypes: true });
-
       for (const e of entries) {
-        const fullPath = path.join(dir, e.name);
-
-        if (e.isDirectory()) {
-          stack.push(fullPath);
-        } else if (e.isFile() && e.name === "chrome") {
-          return fullPath;
-        }
+        const fp = path.join(dir, e.name);
+        if (e.isDirectory()) stack.push(fp);
+        else if (e.isFile() && e.name === "chrome") return fp;
       }
     }
-  } catch (e) {
-    console.warn("⚠️ Erro no finder recursivo:", e.message);
-  }
-
+  } catch {}
   return null;
 }
 
-/* ============================================================
-   FUNÇÃO: Resolve Path do Chrome
-============================================================ */
 function resolveChromePath() {
-  // 1) Procurar no cache local do projeto (.puppeteer)
+  // 1) .puppeteer (empacotado no projeto)
   const localChrome = findChromeBinary(path.join(PUP_CACHE, "chrome"));
   if (localChrome) return localChrome;
 
-  // 2) Tentar o path do próprio Puppeteer
+  // 2) API do Puppeteer
   try {
     const p = puppeteer.executablePath();
     if (p && fs.existsSync(p)) return p;
   } catch {}
 
-  // 3) Tentativas comuns do SO
-  const guesses = [
-    "/usr/bin/google-chrome",
-    "/usr/bin/chromium-browser",
-    "/usr/bin/chromium"
-  ];
-
-  for (const g of guesses) {
+  // 3) Palpites do SO
+  for (const g of ["/usr/bin/google-chrome", "/usr/bin/chromium-browser", "/usr/bin/chromium"]) {
     if (fs.existsSync(g)) return g;
   }
-
-  // 4) Último recurso → deixar o Puppeteer tentar sozinho
   return undefined;
 }
 
-/* ============================================================
-   LAUNCH
-============================================================ */
 async function launchBrowser() {
   const execPath = resolveChromePath();
-
   console.log("🧭 Chrome path:", execPath || "(default by Puppeteer)");
-
   return await puppeteer.launch({
     headless: HEADLESS,
     executablePath: execPath,
@@ -124,49 +91,41 @@ async function launchBrowser() {
   });
 }
 
-/* ============================================================
-   LOGIN
-============================================================ */
+/* ==================== LOGIN ==================== */
 async function ensureLoggedIn(page) {
-  // Se existir cookies.json → tentar login automático
+  // cookies
   try {
     if (fs.existsSync("./cookies.json")) {
       const cookies = JSON.parse(fs.readFileSync("./cookies.json", "utf8"));
-      await page.setCookie(...cookies);
-      console.log("✅ Cookies carregados.");
+      if (Array.isArray(cookies) && cookies.length) {
+        await page.setCookie(...cookies);
+        console.log("✅ Cookies carregados.");
+      }
     }
   } catch (e) {
     console.warn("⚠️ Erro ao carregar cookies:", e.message);
   }
 
   await page.goto(COURSE_URL, { waitUntil: "domcontentloaded" });
-
-  // Se já estiver logado:
   if (!page.url().includes("login")) {
     console.log("✅ Sessão já autenticada.");
     return;
   }
 
+  // login
   console.log("🔑 Efetuando login…");
+  await page.goto("https://estudante.estacio.br", { waitUntil: "domcontentloaded" });
 
-  await page.goto("https://estudante.estacio.br", {
-    waitUntil: "domcontentloaded"
-  });
-
-  // E-mail
-  await page.waitForSelector("input[type='email'], input[name='email']");
+  await page.waitForSelector("input[type='email'], input[name='email']", { timeout: 15000 });
   await page.type("input[type='email'], input[name='email']", EMAIL, { delay: 50 });
+  await page.type("input[type='password'], input[name='senha'], input[name='password']", SENHA, { delay: 50 });
 
-  // Senha
-  await page.type("input[type='password'], input[name='senha']", SENHA, { delay: 50 });
-
-  // Enviar
   await Promise.all([
-    page.waitForNavigation({ waitUntil: "networkidle2" }).catch(() => {}),
+    page.waitForNavigation({ waitUntil: "networkidle2", timeout: 30000 }).catch(() => {}),
     page.click("button[type='submit']").catch(() => {})
   ]);
 
-  // Salvar cookies após login
+  // salva cookies
   try {
     const cookies = await page.cookies();
     fs.writeFileSync("./cookies.json", JSON.stringify(cookies, null, 2));
@@ -176,211 +135,257 @@ async function ensureLoggedIn(page) {
   }
 }
 
-/* ============================================================
-   Aguardar 15 minutos de aula
-============================================================ */
+/* ================ AULA: aguardar 15 minutos ================ */
 async function waitMinimumWatchTime(page, minutes = 15) {
   const totalMs = minutes * 60 * 1000;
   const step = 30 * 1000;
   let waited = 0;
-
   console.log(`⏳ Aguardando ${minutes} minutos de aula…`);
-
   while (waited < totalMs) {
-    await page.waitForTimeout(step);
-    waited += step;
-
-    try {
-      await page.evaluate(() => window.scrollBy(0, 200));
-    } catch {}
+    const chunk = Math.min(step, totalMs - waited);
+    await page.waitForTimeout(chunk);
+    waited += chunk;
+    try { await page.evaluate(() => window.scrollBy(0, 200)); } catch {}
   }
 }
 
-/* ============================================================
-   Marcar aula como concluída
-============================================================ */
+/* ================= Marcar aula concluída ================= */
 async function markLessonCompleted(page) {
-  const xpaths = [
+  const xps = [
     "//button[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'concluir')]",
     "//button[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'finalizar')]",
     "//button[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'completo')]"
   ];
-
-  for (const xp of xpaths) {
+  for (const xp of xps) {
     const [btn] = await page.$x(xp);
     if (btn) {
-      try {
-        await btn.click();
-        console.log("✅ Aula marcada como concluída.");
-        return true;
-      } catch {}
+      try { await btn.click(); console.log("✅ Aula marcada como concluída."); return true; } catch {}
     }
   }
-
   console.log("⚠️ Botão de concluir não encontrado.");
   return false;
 }
 
-/* ============================================================
-   Resolver e responder testes automaticamente
-============================================================ */
+/* ================== Testes/Atividades ================== */
 async function findAndDoModuleTests(page) {
   console.log("🔎 Procurando testes/atividades…");
+  const kws = ["teste", "atividade", "avaliação", "quiz", "prova", "múltipla escolha"];
+  const els = await page.$$("a, button, div, span");
+  const targets = [];
 
-  const keywords = ["teste", "atividade", "avaliação", "quiz", "prova", "múltipla escolha"];
-
-  const elements = await page.$$("a, button, div, span");
-  const found = [];
-
-  for (const el of elements) {
+  for (const el of els) {
     try {
       const txt = (await (await el.getProperty("innerText")).jsonValue() || "").toLowerCase();
-      if (keywords.some(k => txt.includes(k))) found.push(el);
+      if (kws.some(k => txt.includes(k))) targets.push(el);
     } catch {}
   }
 
-  if (found.length === 0) {
-    console.log("ℹ️ Nenhum teste encontrado.");
-    return;
-  }
+  if (!targets.length) { console.log("ℹ️ Nenhuma atividade encontrada."); return; }
+  console.log(`📌 ${targets.length} atividade(s) encontrada(s).`);
 
-  console.log(`📌 ${found.length} atividade(s) encontrada(s).`);
-
-  // Loop nas atividades
-  for (const el of found) {
+  for (const el of targets) {
     try {
       await el.click();
-      await page.waitForTimeout(1500);
+      await page.waitForTimeout(1200);
 
-      const questions = await page.$$(".question, .questao, fieldset, .form-group");
-
-      if (questions.length) {
-        for (const q of questions) {
-          const options = await q.$$("label, .option, .alternativa, .answer");
-          if (options.length) {
-            const pick = Math.floor(Math.random() * options.length);
-            try { await options[pick].click(); } catch {}
+      // perguntas → escolhe uma opção por bloco ou por name
+      const blocks = await page.$$(".question, .questao, .q-item, .enunciado, fieldset, .form-group");
+      if (blocks.length) {
+        for (const b of blocks) {
+          const opts = await b.$$("label, .option, .alternativa, .answer");
+          if (opts.length) {
+            const pick = Math.floor(Math.random() * opts.length);
+            try { await opts[pick].click(); } catch {}
           }
+        }
+      } else {
+        const radios = await page.$$("input[type='radio']");
+        const byName = {};
+        for (const r of radios) {
+          const n = await r.evaluate(e => e.name || "");
+          if (!byName[n]) byName[n] = [];
+          byName[n].push(r);
+        }
+        for (const name in byName) {
+          const opts = byName[name];
+          const pick = Math.floor(Math.random() * opts.length);
+          try { await opts[pick].click(); } catch {}
         }
       }
 
-      // Botão enviar
-      const submitXPaths = [
+      // enviar
+      const submitXps = [
         "//button[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'enviar')]",
         "//button[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'finalizar')]",
+        "//button[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'submeter')]",
         "//button[@type='submit']"
       ];
-
-      for (const xp of submitXPaths) {
+      for (const xp of submitXps) {
         const [btn] = await page.$x(xp);
         if (btn) {
-          try {
-            await Promise.all([
-              page.waitForNavigation({ waitUntil: "networkidle2" }).catch(() => {}),
-              btn.click()
-            ]);
-          } catch {}
+          await Promise.all([
+            page.waitForNavigation({ waitUntil: "networkidle2", timeout: 15000 }).catch(() => {}),
+            btn.click().catch(() => {})
+          ]);
           console.log("✅ Teste enviado.");
           break;
         }
       }
     } catch (e) {
-      console.warn("⚠️ Erro ao processar teste:", e.message);
+      console.warn("⚠️ Erro ao processar atividade:", e.message);
     }
   }
 }
 
-/* ============================================================
-   Execução completa
-============================================================ */
-async function processCourseOnce() {
-  console.log("=== Início ===", new Date().toLocaleString("pt-BR", { timeZone: TIMEZONE }));
+/* ================== Navegação por disciplinas ================== */
+async function gotoHome(page) {
+  await page.goto(COURSE_URL, { waitUntil: "networkidle2" });
+}
 
-  const browser = await launchBrowser();
-  const page = await browser.newPage();
+async function openCourseByIndex(page, courseIndex) {
+  await gotoHome(page);
 
+  const cards = await page.$$(
+    "article, div[class*='card']:not([class*='small']), div[data-testid*='card']"
+  );
+  if (!cards.length || courseIndex >= cards.length) return false;
+
+  const card = cards[courseIndex];
+
+  // pular 100%
   try {
-    await ensureLoggedIn(page);
+    const percentEl = await card.$("div:has-text('%'), span:has-text('%')");
+    if (percentEl) {
+      const txt = (await percentEl.evaluate(el => el.textContent)).trim();
+      const m = txt.match(/(\d{1,3})\s*%/);
+      if (m && Number(m[1]) >= 100) {
+        console.log(`↷ Pulando disciplina ${courseIndex + 1} (100%).`);
+        return false;
+      }
+    }
+  } catch {}
 
-    await page.goto(COURSE_URL, { waitUntil: "networkidle2" });
+  // cliques possíveis
+  const inside = [
+    "button[aria-label*='Ir' i]",
+    "button[aria-label*='Continuar' i]",
+    "a[href]",
+    "button"
+  ];
+  for (const sel of inside) {
+    const el = await card.$(sel);
+    if (el) {
+      try {
+        await Promise.all([
+          page.waitForNavigation({ waitUntil: "networkidle2" }).catch(() => {}),
+          el.click()
+        ]);
+        return true;
+      } catch {}
+    }
+  }
+  // fallback: clicar no card
+  try {
+    await Promise.all([
+      page.waitForNavigation({ waitUntil: "networkidle2" }).catch(() => {}),
+      card.click()
+    ]);
+    return true;
+  } catch {}
+  return false;
+}
 
-    const anchors = await page.$$("a");
+async function processSingleDiscipline(page, maxItemsPerDiscipline = 5) {
+  let processed = 0;
+  while (processed < maxItemsPerDiscipline) {
+    // localizar uma aula/conteúdo
     let lessonHref = null;
-
+    const anchors = await page.$$("a");
     for (const a of anchors) {
       const href = await a.evaluate(el => el.getAttribute("href"));
       if (!href) continue;
-
       const low = href.toLowerCase();
-
       if (
-        low.includes("conteudo") ||
-        low.includes("conteúdos") ||
-        low.includes("aula") ||
-        low.includes("video")
+        low.includes("conteudo") || low.includes("conteúdos") ||
+        low.includes("aula")     || low.includes("video") ||
+        low.includes("vídeo")    || low.includes("material") ||
+        low.includes("assistir")
       ) {
         lessonHref = new URL(href, page.url()).toString();
         break;
       }
     }
 
-    if (!lessonHref) {
-      console.log("ℹ️ Nenhuma aula encontrada.");
-      await browser.close();
-      return;
+    if (lessonHref) {
+      console.log("🔗 Abrindo aula:", lessonHref);
+      await page.goto(lessonHref, { waitUntil: "networkidle2" });
+      try { await page.evaluate(() => { const v = document.querySelector("video"); if (v) v.play().catch(() => {}); }); } catch {}
+      await waitMinimumWatchTime(page, 15);
+      await markLessonCompleted(page);
+      await findAndDoModuleTests(page);
+      processed += 1;
+      try { await page.goBack({ waitUntil: "networkidle2" }); } catch {}
+      continue;
     }
 
-    console.log("🔗 Abrindo aula:", lessonHref);
-    await page.goto(lessonHref, { waitUntil: "networkidle2" });
-
-    // tentar dar play no vídeo
-    try {
-      await page.evaluate(() => {
-        const v = document.querySelector("video");
-        if (v) v.play().catch(() => {});
-      });
-    } catch {}
-
-    await waitMinimumWatchTime(page, 15);
-    await markLessonCompleted(page);
-
+    // se não achou aula, tenta só atividades
     await findAndDoModuleTests(page);
+    break;
+  }
+  console.log(`✅ Itens processados nesta disciplina: ${processed}`);
+}
 
-    console.log("✅ Execução finalizada.");
+async function processAllDisciplines(page, maxDisciplines = 12) {
+  console.log("🗂  Varredura das disciplinas…");
+  await gotoHome(page);
+
+  const count = (await page.$$(
+    "article, div[class*='card']:not([class*='small']), div[data-testid*='card']"
+  )).length;
+
+  const total = Math.min(maxDisciplines, Math.max(count, 0));
+  if (!total) { console.log("ℹ️ Nenhuma disciplina no grid."); return; }
+
+  for (let i = 0; i < total; i++) {
+    console.log(`\n=== 📚 Disciplina ${i + 1}/${total} ===`);
+    const opened = await openCourseByIndex(page, i);
+    if (!opened) { console.log(`↷ Não consegui abrir a disciplina ${i + 1}. Pulando…`); continue; }
+    try { await processSingleDiscipline(page, 5); } catch (e) { console.warn("⚠️ Erro na disciplina:", e.message); }
+    try { await gotoHome(page); } catch {}
+  }
+  console.log("\n✅ Varredura concluída.");
+}
+
+/* ================== Execução e Scheduler ================== */
+async function processCourseOnce() {
+  console.log("=== Início ===", new Date().toLocaleString("pt-BR", { timeZone: TIMEZONE }));
+  const browser = await launchBrowser();
+  const page = await browser.newPage();
+  try {
+    await ensureLoggedIn(page);
+    await processAllDisciplines(page, 12);
   } catch (e) {
     console.error("❌ Erro:", e.message);
   }
-
   await browser.close();
 }
 
-/* ============================================================
-   Scheduler
-============================================================ */
 function startScheduler() {
   console.log(`🔁 CRON ativado: "${CRON_SCHEDULE}" tz:${TIMEZONE}`);
-
   cron.schedule(
     CRON_SCHEDULE,
     async () => {
-      try {
-        await processCourseOnce();
-      } catch (e) {
-        console.error("Erro no agendamento:", e.message);
-      }
+      try { await processCourseOnce(); } catch (e) { console.error("Erro no agendamento:", e.message); }
     },
     { timezone: TIMEZONE }
   );
 }
 
-/* ============================================================
-   Main
-============================================================ */
+/* ================== Main ================== */
 (async () => {
   if (RUN_IMMEDIATELY) {
     console.log("⚡ RUN_IMMEDIATELY=true → executando agora…");
     await processCourseOnce();
   }
-
   startScheduler();
 })();
