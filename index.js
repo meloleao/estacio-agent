@@ -1,8 +1,7 @@
 /**
- * ESTACIO AGENT — index.js (grid + fallback por título + SPA, versão robusta)
- * - Procura cards “Digital (Ead)”/“Continue de onde parou” e clica no botão circular de seta
- * - Fallback por TÍTULO usa XPath + normalização sem acentos + subida ao card + seta mais próxima
- * - Dentro da disciplina: Acessar conteúdo/Avançar → play → 15min → Marcar como estudado → Atividades/Testes
+ * ESTACIO AGENT — index.js (fallback por título com XPath/translate sem acentos)
+ * - Grid: tenta botões; se falhar, abre por TÍTULO com XPath robusto
+ * - Aula: Acessar/Avançar → play → 15min → Marcar como estudado → Atividades/Testes
  */
 
 import puppeteer from "puppeteer";
@@ -24,13 +23,13 @@ const CRON_SCHEDULE = process.env.CRON_SCHEDULE || "0 7 * * *";
 const TIMEZONE = process.env.TIMEZONE || "America/Sao_Paulo";
 const HEADLESS = process.env.HEADLESS !== "false";
 
-/** Títulos de disciplinas para fallback (separados por vírgula) */
+/** Títulos de disciplinas p/ fallback */
 const COURSE_TITLES = (process.env.COURSE_TITLES || "")
   .split(",")
   .map(s => s.trim())
   .filter(Boolean);
 
-/** Diretório onde o Chrome foi instalado no build */
+/** Diretório do Chrome baixado no build */
 const PUP_CACHE = process.env.PUPPETEER_CACHE_DIR || path.join(process.cwd(), ".puppeteer");
 
 /* ================= Cookies opcionais ================= */
@@ -231,7 +230,7 @@ async function findAndDoModuleTests(page) {
     try { await el.click(); await page.waitForTimeout(1000); } catch {}
   }
 
-  // responder (heurística)
+  // responder (heurística simples)
   const blocks = await page.$$(".question, .questao, .q-item, .enunciado, fieldset, .form-group");
   if (blocks.length) {
     for (const b of blocks) {
@@ -315,40 +314,39 @@ async function getOpenCourseButtons(page) {
 }
 
 /**
- * Fallback MUITO ROBUSTO:
- *  1) Acha elemento cujo texto contenha o título (normalizado, sem acentos) via XPath global
- *  2) Sobe até o container-card (ancestor com “Digital (Ead)” ou borda/box grande)
- *  3) Dentro do card, tenta o botão circular de seta; se falhar, clica no card
- *  4) Último recurso: acha o botão circular mais PRÓXIMO (distância do centro ao centro)
+ * Fallback MUITO ROBUSTO (XPath + translate para tirar acentos):
+ *  1) Espera o título aparecer no DOM (mesmo com SPA)
+ *  2) Acha nós que contenham o título, sobe ao "card"
+ *  3) Prioriza a seta dentro do card; se não houver, clica no card
+ *  4) Último recurso: seta mais próxima do texto
  */
 async function openDisciplineByTitle(page, title) {
   await page.goto(COURSE_URL, { waitUntil: "networkidle2" });
 
-  const opened = await page.evaluate(async (titleIn) => {
-    const norm = (s) => (s || "")
-      .toString()
-      .normalize("NFD")
-      .replace(/\p{Diacritic}/gu, "")
-      .toLowerCase();
+  // 1) Espera o texto (sem acento) aparecer no DOM
+  const okWait = await page.waitForFunction(
+    (t) => {
+      const norm = s => s.normalize("NFD").replace(/\p{Diacritic}/gu, "").toLowerCase();
+      const body = document.body;
+      return body && norm(body.innerText || "").includes(norm(t));
+    },
+    { timeout: 15000 },
+    title
+  ).catch(() => false);
 
-    const titleNorm = norm(titleIn);
+  if (!okWait) return false;
 
-    // 1) Captura TODOS os nós de texto que contenham o título (sem acento)
-    const allTextNodes = Array.from(document.querySelectorAll("body *"))
-      .filter(el => {
-        const t = norm(el.textContent || "");
-        return t.includes(titleNorm);
-      });
+  // 2–4) faz tudo no contexto da página com XPath/translate
+  const opened = await page.evaluate((titleIn) => {
+    const title = titleIn;
 
-    if (!allTextNodes.length) return false;
-
-    // utilidades
+    // função para checar “card”
     const isBigBox = (el) => {
       const r = el.getBoundingClientRect();
       return r && r.width >= 280 && r.height >= 160;
     };
     const hasDigitalEad = (el) => {
-      const t = norm(el.innerText || "");
+      const t = (el.innerText || "").toLowerCase();
       return t.includes("digital (ead)") || t.includes("continue de onde parou");
     };
     const isArrowButton = (btn) => {
@@ -361,11 +359,39 @@ async function openDisciplineByTitle(page, title) {
       } catch { return false; }
     };
 
-    // 2) Para cada candidato, sobe ao "card"
+    // Helpers
+    const clickAndOk = (node) => {
+      node.scrollIntoView({ block: "center", inline: "center" });
+      node.click();
+      return true;
+    };
+
+    // XPATH: translate para remover acentos (mapeamento a-z)
+    const AC1 = "ÁÀÂÃÄáàâãäÉÈÊËéèêëÍÌÎÏíìîïÓÒÔÕÖóòôõöÚÙÛÜúùûüÇç";
+    const AC2 = "AAAAAaaaaaEEEEeeeeIIIIiiiiOOOOOoooooUUUUuuuuCc";
+
+    const xTitle = `
+      //*[contains(
+        translate(normalize-space(string(.)),
+          '${AC1}', '${AC2}'
+        ),
+        translate('${title}', '${AC1}', '${AC2}')
+      )]
+    `;
+
+    const result = document.evaluate(xTitle, document, null, XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null);
+    if (!result || result.snapshotLength === 0) return false;
+
+    // coleta candidatos (subida ao card)
     const candidates = [];
-    for (const el of allTextNodes) {
+    for (let i = 0; i < result.snapshotLength; i++) {
+      let el = result.snapshotItem(i);
+      // ignora nós invisíveis/zero dimensão
+      const vr = el.getBoundingClientRect();
+      if (!vr || (vr.width === 0 && vr.height === 0)) continue;
+
       let card = el;
-      for (let i = 0; i < 8 && card; i++) {
+      for (let j = 0; j < 10 && card; j++) {
         if (card.matches && (card.matches("article, section") || isBigBox(card) || hasDigitalEad(card))) break;
         card = card.parentElement;
       }
@@ -374,26 +400,20 @@ async function openDisciplineByTitle(page, title) {
     }
     if (!candidates.length) return false;
 
-    // 3) Dentro do card, tenta clicar no botão circular de seta
-    const clickAndReturn = (node) => {
-      node.scrollIntoView({ block: "center", inline: "center" });
-      node.click();
-      return true;
-    };
-
+    // 3) prioriza seta do card
     for (const { card } of candidates) {
       const btns = Array.from(card.querySelectorAll("button"));
       let arrow = null;
-      for (const b of btns) if (isArrowButton(b)) arrow = b; // pega o último “circular”
-      if (arrow) return clickAndReturn(arrow);
+      for (const b of btns) if (isArrowButton(b)) arrow = b;
+      if (arrow) return clickAndOk(arrow);
     }
 
-    // 3b) Se não achar seta, clica no próprio card
+    // 3b) clica no card se não achou seta
     for (const { card } of candidates) {
-      return clickAndReturn(card);
+      return clickAndOk(card);
     }
 
-    // 4) Último recurso: achar a seta mais PRÓXIMA do texto
+    // 4) último recurso: seta mais próxima do texto
     const arrows = Array.from(document.querySelectorAll("button")).filter(isArrowButton);
     if (!arrows.length) return false;
 
@@ -412,14 +432,14 @@ async function openDisciplineByTitle(page, title) {
         if (d < bestD) { bestD = d; best = ar; }
       }
     }
-    if (best) return clickAndReturn(best);
+    if (best) return clickAndOk(best);
 
     return false;
   }, title);
 
   if (!opened) return false;
 
-  // espera efeito SPA
+  // espera sair do grid / mudar URL
   const ok = await new Promise(resolve => {
     const oldUrl = page.url();
     const start = Date.now();
