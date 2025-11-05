@@ -1,8 +1,8 @@
 /**
- * ESTACIO AGENT — index.js (grid + fallback por título + SPA)
- * - Procura cards pelo texto “Digital (Ead)”/“Continue de onde parou” e clica no botão circular de seta
- * - Fallback: se não achar botões, procura o card por TÍTULO (COURSE_TITLES no .env, ex: "Matemática e Lógica")
- * - Dentro da disciplina: Acessar conteúdo/Avançar → play vídeo → 15min → Marcar como estudado → Atividades/Testes
+ * ESTACIO AGENT — index.js (grid + fallback por título + SPA, versão robusta)
+ * - Procura cards “Digital (Ead)”/“Continue de onde parou” e clica no botão circular de seta
+ * - Fallback por TÍTULO usa XPath + normalização sem acentos + subida ao card + seta mais próxima
+ * - Dentro da disciplina: Acessar conteúdo/Avançar → play → 15min → Marcar como estudado → Atividades/Testes
  */
 
 import puppeteer from "puppeteer";
@@ -196,7 +196,6 @@ async function waitMinimumWatchTime(page, minutes = 15) {
 /* ================ Ações dentro da aula ================ */
 
 async function clickPrimaryProgressButtons(page) {
-  // “Acessar conteúdo”, “Avançar”, “Próximo”
   const keys = ["acessar conteúdo", "avançar", "próximo", "acessar conteudo"];
   const btn = await findElementByText(page, "button, a[role='button']", keys);
   if (!btn) return false;
@@ -205,7 +204,6 @@ async function clickPrimaryProgressButtons(page) {
 }
 
 async function markLessonCompleted(page) {
-  // Botão com timer “Marcar como estudado (mm:ss)”
   const key = "marcar como estudado";
   let tries = 20;
   while (tries--) {
@@ -266,9 +264,6 @@ async function findAndDoModuleTests(page) {
 
 /* ================== GRID: localizar e abrir disciplinas ================== */
 
-/**
- * Botões de “seta” dentro de cards.
- */
 async function getOpenCourseButtons(page) {
   const containers = await page.$$("article, section, div");
   const buttons = [];
@@ -296,9 +291,8 @@ async function getOpenCourseButtons(page) {
           if (!rect || !rect.width || !rect.height) return false;
           if (rect.width < 40 || rect.height < 40) return false;
           const approxSquare = Math.abs(rect.width - rect.height) <= 16;
-          if (!approxSquare) return false;
           const hasIcon = !!el.querySelector("svg");
-          return hasIcon;
+          return approxSquare && hasIcon;
         } catch { return false; }
       });
       if (ok) circleCandidates.push(b);
@@ -321,51 +315,127 @@ async function getOpenCourseButtons(page) {
 }
 
 /**
- * Fallback: encontra o **card** cujo texto contenha um TÍTULO (ex: "Matemática e Lógica"),
- * e tenta clicar no **botão circular de seta** dentro dele. Se não achar o botão, clica no próprio card.
+ * Fallback MUITO ROBUSTO:
+ *  1) Acha elemento cujo texto contenha o título (normalizado, sem acentos) via XPath global
+ *  2) Sobe até o container-card (ancestor com “Digital (Ead)” ou borda/box grande)
+ *  3) Dentro do card, tenta o botão circular de seta; se falhar, clica no card
+ *  4) Último recurso: acha o botão circular mais PRÓXIMO (distância do centro ao centro)
  */
 async function openDisciplineByTitle(page, title) {
   await page.goto(COURSE_URL, { waitUntil: "networkidle2" });
-  const lowerTitle = title.toLowerCase();
 
-  const containers = await page.$$("article, section, div");
-  for (const c of containers) {
-    let isThis = false;
-    try {
-      const txt = (await (await c.getProperty("innerText")).jsonValue() || "").toLowerCase();
-      if (txt.includes(lowerTitle)) isThis = true;
-    } catch {}
-    if (!isThis) continue;
+  const opened = await page.evaluate(async (titleIn) => {
+    const norm = (s) => (s || "")
+      .toString()
+      .normalize("NFD")
+      .replace(/\p{Diacritic}/gu, "")
+      .toLowerCase();
 
-    // dentro do card, prioriza botão circular
-    const btns = await c.$$("button");
-    let arrow = null;
-    for (const b of btns) {
-      const ok = await b.evaluate((el) => {
-        try {
-          const rect = el.getBoundingClientRect();
-          if (!rect || rect.width < 40 || rect.height < 40) return false;
-          const approxSquare = Math.abs(rect.width - rect.height) <= 16;
-          const hasIcon = !!el.querySelector("svg");
-          return approxSquare && hasIcon;
-        } catch { return false; }
+    const titleNorm = norm(titleIn);
+
+    // 1) Captura TODOS os nós de texto que contenham o título (sem acento)
+    const allTextNodes = Array.from(document.querySelectorAll("body *"))
+      .filter(el => {
+        const t = norm(el.textContent || "");
+        return t.includes(titleNorm);
       });
-      if (ok) arrow = b;
+
+    if (!allTextNodes.length) return false;
+
+    // utilidades
+    const isBigBox = (el) => {
+      const r = el.getBoundingClientRect();
+      return r && r.width >= 280 && r.height >= 160;
+    };
+    const hasDigitalEad = (el) => {
+      const t = norm(el.innerText || "");
+      return t.includes("digital (ead)") || t.includes("continue de onde parou");
+    };
+    const isArrowButton = (btn) => {
+      try {
+        const r = btn.getBoundingClientRect();
+        if (!r || r.width < 36 || r.height < 36) return false;
+        const approxSquare = Math.abs(r.width - r.height) <= 20;
+        const hasIcon = !!btn.querySelector("svg");
+        return approxSquare && hasIcon;
+      } catch { return false; }
+    };
+
+    // 2) Para cada candidato, sobe ao "card"
+    const candidates = [];
+    for (const el of allTextNodes) {
+      let card = el;
+      for (let i = 0; i < 8 && card; i++) {
+        if (card.matches && (card.matches("article, section") || isBigBox(card) || hasDigitalEad(card))) break;
+        card = card.parentElement;
+      }
+      if (!card) continue;
+      candidates.push({ el, card });
+    }
+    if (!candidates.length) return false;
+
+    // 3) Dentro do card, tenta clicar no botão circular de seta
+    const clickAndReturn = (node) => {
+      node.scrollIntoView({ block: "center", inline: "center" });
+      node.click();
+      return true;
+    };
+
+    for (const { card } of candidates) {
+      const btns = Array.from(card.querySelectorAll("button"));
+      let arrow = null;
+      for (const b of btns) if (isArrowButton(b)) arrow = b; // pega o último “circular”
+      if (arrow) return clickAndReturn(arrow);
     }
 
-    if (arrow) {
-      const ok = await clickAndWaitSPA(page, arrow, 10000);
-      if (ok) return true;
+    // 3b) Se não achar seta, clica no próprio card
+    for (const { card } of candidates) {
+      return clickAndReturn(card);
     }
 
-    // fallback: clica no card
-    try {
-      await c.evaluate(el => el.scrollIntoView({ block: "center" }));
-      const ok = await clickAndWaitSPA(page, c, 10000);
-      if (ok) return true;
-    } catch {}
-  }
-  return false;
+    // 4) Último recurso: achar a seta mais PRÓXIMA do texto
+    const arrows = Array.from(document.querySelectorAll("button")).filter(isArrowButton);
+    if (!arrows.length) return false;
+
+    const dist = (a, b) => {
+      const ra = a.getBoundingClientRect();
+      const rb = b.getBoundingClientRect();
+      const ax = ra.left + ra.width / 2, ay = ra.top + ra.height / 2;
+      const bx = rb.left + rb.width / 2, by = rb.top + rb.height / 2;
+      return Math.hypot(ax - bx, ay - by);
+    };
+
+    let best = null, bestD = Infinity;
+    for (const { el } of candidates) {
+      for (const ar of arrows) {
+        const d = dist(el, ar);
+        if (d < bestD) { bestD = d; best = ar; }
+      }
+    }
+    if (best) return clickAndReturn(best);
+
+    return false;
+  }, title);
+
+  if (!opened) return false;
+
+  // espera efeito SPA
+  const ok = await new Promise(resolve => {
+    const oldUrl = page.url();
+    const start = Date.now();
+    const loop = async () => {
+      if (page.url() !== oldUrl) return resolve(true);
+      const stillOnGrid = await page.evaluate(() => {
+        const t = (document.body.innerText || "").toLowerCase();
+        return t.includes("minhas disciplinas") || t.includes("continue de onde parou");
+      }).catch(() => false);
+      if (!stillOnGrid) return resolve(true);
+      if (Date.now() - start > 10000) return resolve(false);
+      setTimeout(loop, 250);
+    };
+    loop();
+  });
+  return ok;
 }
 
 async function gotoHome(page) {
@@ -375,9 +445,7 @@ async function gotoHome(page) {
 async function openDisciplineByIndex(page, idx) {
   await gotoHome(page);
   const btns = await getOpenCourseButtons(page);
-  if (!btns.length || idx >= btns.length) {
-    return false;
-  }
+  if (!btns.length || idx >= btns.length) return false;
   const ok = await clickAndWaitSPA(page, btns[idx], 10000);
   return ok;
 }
@@ -420,14 +488,10 @@ async function processAllDisciplines(page, maxDisciplines = 12) {
 
   if (!total && COURSE_TITLES.length) {
     console.log("ℹ️ Nenhum botão detectado — usando fallback por TÍTULO…");
-    // percorre apenas os títulos listados
     for (const title of COURSE_TITLES) {
       console.log(`\n=== 🎯 Tentando abrir por título: ${title} ===`);
       const opened = await openDisciplineByTitle(page, title);
-      if (!opened) {
-        console.log(`↷ Não consegui abrir "${title}". Pulando…`);
-        continue;
-      }
+      if (!opened) { console.log(`↷ Não consegui abrir "${title}". Pulando…`); continue; }
       try { await processSingleDiscipline(page, 5); } catch (e) { console.warn("⚠️ Erro na disciplina:", e.message); }
       try { await gotoHome(page); } catch {}
     }
@@ -444,10 +508,7 @@ async function processAllDisciplines(page, maxDisciplines = 12) {
   for (let i = 0; i < total; i++) {
     console.log(`\n=== 📚 Disciplina ${i + 1}/${total} ===`);
     const opened = await openDisciplineByIndex(page, i);
-    if (!opened) {
-      console.log(`↷ Clique não abriu a disciplina ${i + 1}. Pulando…`);
-      continue;
-    }
+    if (!opened) { console.log(`↷ Clique não abriu a disciplina ${i + 1}. Pulando…`); continue; }
 
     try { await processSingleDiscipline(page, 5); } catch (e) { console.warn("⚠️ Erro na disciplina:", e.message); }
     try { await gotoHome(page); } catch {}
