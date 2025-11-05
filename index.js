@@ -1,9 +1,9 @@
 /**
- * ESTACIO AGENT — index.js (sem XPath + SPA-safe)
- * - Varre TODAS as disciplinas do grid
- * - Abre cada card clicando no botão circular de "seta"
- * - Assiste 15min, tenta concluir e faz testes
- * - Compatível com Render (Chrome em .puppeteer)
+ * ESTACIO AGENT — index.js (robusto para grid + SPA)
+ * - Varre TODAS as disciplinas (card "Digital (Ead)" e "Continue de onde parou")
+ * - Clica no botão circular de seta do card
+ * - Dentro da disciplina: Acessar conteúdo/Avançar → play → 15min → Marcar como estudado
+ * - Faz atividades/testes e volta ao grid
  */
 
 import puppeteer from "puppeteer";
@@ -58,17 +58,14 @@ function findChromeBinary(startDir) {
 }
 
 function resolveChromePath() {
-  // 1) .puppeteer (empacotado no projeto)
   const localChrome = findChromeBinary(path.join(PUP_CACHE, "chrome"));
   if (localChrome) return localChrome;
 
-  // 2) API do Puppeteer
   try {
     const p = puppeteer.executablePath();
     if (p && fs.existsSync(p)) return p;
   } catch {}
 
-  // 3) Palpites do SO
   for (const g of ["/usr/bin/google-chrome", "/usr/bin/chromium-browser", "/usr/bin/chromium"]) {
     if (fs.existsSync(g)) return g;
   }
@@ -92,9 +89,8 @@ async function launchBrowser() {
   });
 }
 
-/* ==================== HELPERS (sem XPath) ==================== */
+/* ==================== HELPERS ==================== */
 
-/** Primeiro elemento cujo texto inclui um dos termos (case-insensitive). */
 async function findElementByText(pageOrRoot, selector, keywords) {
   const els = await pageOrRoot.$$(selector);
   for (const el of els) {
@@ -106,7 +102,6 @@ async function findElementByText(pageOrRoot, selector, keywords) {
   return null;
 }
 
-/** Todos os elementos do selector cujo texto contém algum termo. */
 async function findAllByText(pageOrRoot, selector, keywords) {
   const out = [];
   const els = await pageOrRoot.$$(selector);
@@ -119,32 +114,27 @@ async function findAllByText(pageOrRoot, selector, keywords) {
   return out;
 }
 
-/** Clique com suporte a SPA: tenta detectar mudança de URL OU sumiço do texto “Minhas Disciplinas”. */
-async function clickAndWaitSPA(page, element, timeout = 8000) {
+/** Clique com suporte a SPA (espera mudar URL OU sair do grid) */
+async function clickAndWaitSPA(page, element, timeout = 9000) {
   const oldUrl = page.url();
   try { await element.evaluate(el => el.scrollIntoView({ block: "center", inline: "center" })); } catch {}
-  await element.click({ delay: 40 });
+  await element.click({ delay: 50 });
 
   const start = Date.now();
   while (Date.now() - start < timeout) {
-    const urlChanged = page.url() !== oldUrl;
-    if (urlChanged) return true;
-
-    // se a página é SPA, a URL pode não mudar — nesse caso esperamos o texto de cabeçalho desaparecer
+    if (page.url() !== oldUrl) return true;
     const stillOnGrid = await page.evaluate(() => {
-      const text = (document.body.innerText || "").toLowerCase();
-      return text.includes("minhas disciplinas");
+      const t = (document.body.innerText || "").toLowerCase();
+      return t.includes("minhas disciplinas") || t.includes("continue de onde parou");
     }).catch(() => false);
-
     if (!stillOnGrid) return true;
-    await page.waitForTimeout(300);
+    await page.waitForTimeout(250);
   }
   return false;
 }
 
 /* ==================== LOGIN ==================== */
 async function ensureLoggedIn(page) {
-  // cookies
   try {
     if (fs.existsSync("./cookies.json")) {
       const cookies = JSON.parse(fs.readFileSync("./cookies.json", "utf8"));
@@ -163,7 +153,6 @@ async function ensureLoggedIn(page) {
     return;
   }
 
-  // login
   console.log("🔑 Efetuando login…");
   await page.goto("https://estudante.estacio.br", { waitUntil: "domcontentloaded" });
 
@@ -176,7 +165,6 @@ async function ensureLoggedIn(page) {
     page.click("button[type='submit']").catch(() => {})
   ]);
 
-  // salva cookies
   try {
     const cookies = await page.cookies();
     fs.writeFileSync("./cookies.json", JSON.stringify(cookies, null, 2));
@@ -186,12 +174,12 @@ async function ensureLoggedIn(page) {
   }
 }
 
-/* ================ AULA: aguardar 15 minutos ================ */
+/* ================ Tempo mínimo da aula ================ */
 async function waitMinimumWatchTime(page, minutes = 15) {
   const totalMs = minutes * 60 * 1000;
-  const step = 30 * 1000;
+  const step = 30000;
   let waited = 0;
-  console.log(`⏳ Aguardando ${minutes} minutos de aula…`);
+  console.log(`⏳ Aguardando ${minutes} minutos…`);
   while (waited < totalMs) {
     const chunk = Math.min(step, totalMs - waited);
     await page.waitForTimeout(chunk);
@@ -200,176 +188,194 @@ async function waitMinimumWatchTime(page, minutes = 15) {
   }
 }
 
-/* ================= Marcar aula concluída (sem XPath) ================= */
-async function markLessonCompleted(page) {
-  const keys = ["concluir", "finalizar", "completo", "concluída", "concluido"];
+/* ================ Ações dentro da aula ================ */
+
+async function clickPrimaryProgressButtons(page) {
+  // “Acessar conteúdo”, “Avançar”, “Próximo”
+  const keys = ["acessar conteúdo", "avançar", "próximo", "acessar conteudo"];
   const btn = await findElementByText(page, "button, a[role='button']", keys);
-  if (btn) {
-    try {
-      await btn.click();
-      console.log("✅ Aula marcada como concluída.");
-      return true;
-    } catch {}
-  }
-  console.log("⚠️ Botão de concluir não encontrado.");
+  if (!btn) return false;
+  try { await btn.click(); await page.waitForTimeout(800); return true; } catch {}
   return false;
 }
 
-/* ================== Testes/Atividades (sem XPath) ================== */
+async function markLessonCompleted(page) {
+  // Botão fica com um timer: “Marcar como estudado (03:11)”
+  const key = "marcar como estudado";
+  let tries = 20;
+  while (tries--) {
+    const el = await findElementByText(page, "button, a[role='button'], div", [key]);
+    if (el) {
+      const txt = (await (await el.getProperty("innerText")).jsonValue() || "").toLowerCase();
+      const hasTimer = /\(\d+:\d+\)/.test(txt);
+      if (!hasTimer) {
+        try { await el.click(); console.log("✅ Aula marcada como estudada."); return true; } catch {}
+      }
+    }
+    await page.waitForTimeout(6000);
+  }
+  console.log("⚠️ Não consegui marcar como estudada (tempo não liberou?).");
+  return false;
+}
+
+/* ================== Testes/Atividades ================== */
 async function findAndDoModuleTests(page) {
   console.log("🔎 Procurando testes/atividades…");
-  const kws = ["teste", "atividade", "avaliação", "quiz", "prova", "múltipla escolha"];
+  const kws = ["atividade", "teste", "avaliação", "quiz", "prova", "múltipla escolha"];
 
-  const candidates = await findAllByText(page, "a, button, div, span", kws);
-  if (!candidates.length) { console.log("ℹ️ Nenhuma atividade encontrada."); return; }
-  console.log(`📌 ${candidates.length} atividade(s) encontrada(s).`);
-
-  for (const el of candidates) {
+  // entrar nas atividades se houver link/botão
+  const entries = await findAllByText(page, "a, button, div, span", kws);
+  for (const el of entries) {
     try {
       await el.click();
-      await page.waitForTimeout(1200);
+      await page.waitForTimeout(1000);
+    } catch {}
+  }
 
-      // perguntas → escolhe uma opção por bloco ou por name
-      const blocks = await page.$$(".question, .questao, .q-item, .enunciado, fieldset, .form-group");
-      if (blocks.length) {
-        for (const b of blocks) {
-          const opts = await b.$$("label, .option, .alternativa, .answer, input[type='radio'] + label");
-          if (opts.length) {
-            const pick = Math.floor(Math.random() * opts.length);
-            try { await opts[pick].click(); } catch {}
-          }
-        }
-      } else {
-        const radios = await page.$$("input[type='radio']");
-        const byName = {};
-        for (const r of radios) {
-          const n = await r.evaluate(e => e.name || "");
-          if (!byName[n]) byName[n] = [];
-          byName[n].push(r);
-        }
-        for (const name in byName) {
-          const opts = byName[name];
-          const pick = Math.floor(Math.random() * opts.length);
-          try { await opts[pick].click(); } catch {}
-        }
+  // responder (heurística)
+  const blocks = await page.$$(".question, .questao, .q-item, .enunciado, fieldset, .form-group");
+  if (blocks.length) {
+    for (const b of blocks) {
+      const opts = await b.$$("label, .option, .alternativa, .answer, input[type='radio'] + label, li");
+      if (opts.length) {
+        const pick = Math.floor(Math.random() * opts.length);
+        try { await opts[pick].click(); } catch {}
       }
-
-      // enviar (busca por texto)
-      const sent = await findElementByText(page, "button, a[role='button']", ["enviar", "finalizar", "submeter", "concluir"]);
-      if (sent) {
-        try {
-          await sent.click();
-          await page.waitForTimeout(1500);
-          console.log("✅ Teste enviado.");
-        } catch {}
-      }
-    } catch (e) {
-      console.warn("⚠️ Erro ao processar atividade:", e.message);
     }
+  } else {
+    const radios = await page.$$("input[type='radio']");
+    const byName = {};
+    for (const r of radios) {
+      const n = await r.evaluate(e => e.name || "");
+      if (!byName[n]) byName[n] = [];
+      byName[n].push(r);
+    }
+    for (const name in byName) {
+      const opts = byName[name];
+      const pick = Math.floor(Math.random() * opts.length);
+      try { await opts[pick].click(); } catch {}
+    }
+  }
+
+  // botão “Responda”, “Enviar”, “Finalizar”
+  const send = await findElementByText(page, "button, a[role='button']", ["responda", "enviar", "finalizar", "submeter", "concluir"]);
+  if (send) {
+    try { await send.click(); await page.waitForTimeout(1200); console.log("✅ Teste/atividade enviado(a)."); } catch {}
   }
 }
 
-/* ================== Grid → encontrar e abrir cada disciplina ================== */
+/* ================== GRID: localizar e abrir disciplinas ================== */
 
 /**
- * Retorna os botões circulares de "seta" presentes em cada card de disciplina.
- * Heurísticas:
- *  - botão dentro de um container que tenha porcentagem (%) ou “x/y”
- *  - botão aproximadamente quadrado (circular) e com SVG
- *  - tamanho entre 32 e 80px (para filtrar botões pequenos)
+ * Retorna os botões circulares de "seta" dentro de cards.
+ * Estratégias:
+ *  - procurar containers cujo texto contenha “Digital (Ead)” OU “Continue de onde parou”
+ *  - dentro do container, pegar o **último** botão com `svg` e tamanho ≥ 40px
  */
 async function getOpenCourseButtons(page) {
-  const btns = await page.$$("button");
-  const out = [];
+  const containers = await page.$$("article, section, div");
+  const buttons = [];
 
-  for (const b of btns) {
-    const ok = await b.evaluate((el) => {
-      try {
-        const rect = el.getBoundingClientRect();
-        if (!rect || !rect.width || !rect.height) return false;
-        const approxSquare = Math.abs(rect.width - rect.height) <= 14;
-        if (!approxSquare) return false;
-        if (rect.width < 32 || rect.width > 80) return false;
+  for (const c of containers) {
+    let isCard = false;
+    try {
+      const txt = (await (await c.getProperty("innerText")).jsonValue() || "").toLowerCase();
+      if (!txt) continue;
+      if (txt.includes("digital (ead)") || txt.includes("continue de onde parou")) {
+        isCard = true;
+      }
+    } catch {}
 
-        const hasIcon = !!el.querySelector("svg");
-        // sobe no DOM procurando um "card" com % ou x/y
-        let node = el;
-        let score = 0;
-        while (node && node !== document.body) {
-          const txt = (node.innerText || "").toLowerCase();
-          if (/%/.test(txt) || /\d+\s*\/\s*\d+/.test(txt)) { score++; break; }
-          node = node.parentElement;
-        }
-        return hasIcon && score > 0;
-      } catch { return false; }
-    });
-    if (ok) out.push(b);
+    if (!isCard) continue;
+
+    // pega botões do card
+    const btns = await c.$$("button");
+    if (!btns.length) continue;
+
+    // filtra por "circular com svg" e tamanho
+    const circleCandidates = [];
+    for (const b of btns) {
+      const ok = await b.evaluate((el) => {
+        try {
+          const rect = el.getBoundingClientRect();
+          if (!rect || !rect.width || !rect.height) return false;
+          if (rect.width < 40 || rect.height < 40) return false;
+          const approxSquare = Math.abs(rect.width - rect.height) <= 16;
+          if (!approxSquare) return false;
+          const hasIcon = !!el.querySelector("svg");
+          return hasIcon;
+        } catch { return false; }
+      });
+      if (ok) circleCandidates.push(b);
+    }
+
+    const chosen = circleCandidates.length ? circleCandidates[circleCandidates.length - 1] : btns[btns.length - 1];
+    if (chosen) buttons.push(chosen);
   }
-  return out;
+
+  // de-duplicar por referência
+  const uniq = [];
+  for (const b of buttons) {
+    let dup = false;
+    for (const u of uniq) {
+      const same = await page.evaluate((a, b) => a === b, u, b).catch(() => false);
+      if (same) { dup = true; break; }
+    }
+    if (!dup) uniq.push(b);
+  }
+  return uniq;
 }
 
 async function gotoHome(page) {
   await page.goto(COURSE_URL, { waitUntil: "networkidle2" });
 }
 
-/** Abre uma disciplina clicando no N-ésimo botão de “seta” detectado no grid. */
-async function openDisciplineByButtonIndex(page, idx) {
+async function openDisciplineByIndex(page, idx) {
   await gotoHome(page);
   const btns = await getOpenCourseButtons(page);
   if (!btns.length || idx >= btns.length) {
     console.log("⚠️ Nenhum botão de abrir disciplina detectado.");
     return false;
   }
-
-  const btn = btns[idx];
-
-  // evita clicar no "i" (informações) — normalmente o "i" é pequeno e não passa nas heurísticas
-  const ok = await clickAndWaitSPA(page, btn, 9000);
+  const ok = await clickAndWaitSPA(page, btns[idx], 10000);
   return ok;
 }
 
-/* ================== Processar disciplina ================== */
+/* ================== Processamento de uma disciplina ================== */
 async function processSingleDiscipline(page, maxItemsPerDiscipline = 5) {
   let processed = 0;
   while (processed < maxItemsPerDiscipline) {
-    // localizar uma aula/conteúdo
-    let lessonHref = null;
-    const anchors = await page.$$("a[href]");
-    for (const a of anchors) {
-      const href = await a.evaluate(el => el.getAttribute("href"));
-      if (!href) continue;
-      const low = href.toLowerCase();
-      if (
-        low.includes("conteudo") || low.includes("conteúdos") ||
-        low.includes("aula")     || low.includes("video") ||
-        low.includes("vídeo")    || low.includes("material") ||
-        low.includes("assistir")
-      ) {
-        lessonHref = new URL(href, page.url()).toString();
-        break;
-      }
-    }
+    // tenta “Acessar conteúdo/Avançar”
+    await clickPrimaryProgressButtons(page);
 
-    if (lessonHref) {
-      console.log("🔗 Abrindo aula:", lessonHref);
-      await page.goto(lessonHref, { waitUntil: "networkidle2" });
-      try { await page.evaluate(() => { const v = document.querySelector("video"); if (v) v.play().catch(() => {}); }); } catch {}
-      await waitMinimumWatchTime(page, 15);
-      await markLessonCompleted(page);
-      await findAndDoModuleTests(page);
-      processed += 1;
-      try { await page.goBack({ waitUntil: "networkidle2" }); } catch {}
-      continue;
-    }
+    // dá play em vídeo (se existir)
+    try {
+      await page.evaluate(() => { const v = document.querySelector("video"); if (v) v.play().catch(() => {}); });
+    } catch {}
 
-    // se não achou aula, tenta só atividades
+    // se entrou numa página de conteúdo, espera e tenta marcar
+    await waitMinimumWatchTime(page, 15);
+    await markLessonCompleted(page);
+
+    // procura e executa atividades
     await findAndDoModuleTests(page);
-    break;
+
+    processed += 1;
+
+    // Tenta voltar (se houver “Voltar”)
+    const backBtn = await findElementByText(page, "a, button", ["voltar", "retornar"]);
+    if (backBtn) {
+      try { await backBtn.click(); await page.waitForTimeout(1200); } catch {}
+    } else {
+      // ou navega pro grid de novo
+      try { await gotoHome(page); } catch {}
+      break;
+    }
   }
   console.log(`✅ Itens processados nesta disciplina: ${processed}`);
 }
 
-/* ================== Orquestrador: processar TODAS ================== */
+/* ================== Orquestrador ================== */
 async function processAllDisciplines(page, maxDisciplines = 12) {
   console.log("🗂  Varredura das disciplinas…");
   await gotoHome(page);
@@ -386,14 +392,14 @@ async function processAllDisciplines(page, maxDisciplines = 12) {
 
   for (let i = 0; i < total; i++) {
     console.log(`\n=== 📚 Disciplina ${i + 1}/${total} ===`);
-    const opened = await openDisciplineByButtonIndex(page, i);
+    const opened = await openDisciplineByIndex(page, i);
     if (!opened) {
       console.log(`↷ Clique não abriu a disciplina ${i + 1}. Pulando…`);
       continue;
     }
 
     try {
-      await processSingleDiscipline(page, 5); // até 5 itens por disciplina
+      await processSingleDiscipline(page, 5);
     } catch (e) {
       console.warn("⚠️ Erro na disciplina:", e.message);
     }
@@ -404,7 +410,7 @@ async function processAllDisciplines(page, maxDisciplines = 12) {
   console.log("\n✅ Varredura concluída.");
 }
 
-/* ================== Execução e Scheduler ================== */
+/* ================== Execução/Scheduler ================== */
 async function processCourseOnce() {
   console.log("=== Início ===", new Date().toLocaleString("pt-BR", { timeZone: TIMEZONE }));
   const browser = await launchBrowser();
