@@ -1,7 +1,10 @@
 /**
  * ESTACIO AGENT — index.js
  * - Login com cookies
- * - Grid: tenta botões → fallback por TÍTULO com rolagem + XPath + scanner
+ * - Abre disciplina via:
+ *    1) botão no grid (seta)
+ *    2) fallback por TÍTULO (scroll + XPath + scanner)
+ *    3) ✅ fallback por URL mapeada no .env (título → URL)
  * - Aula: Acessar/Avançar → play → 15min → Marcar como estudado → Atividades
  * - Compatível com Puppeteer recente (usa sleep() em vez de page.waitForTimeout)
  */
@@ -24,17 +27,46 @@ const CRON_SCHEDULE = process.env.CRON_SCHEDULE || "0 7 * * *";
 const TIMEZONE = process.env.TIMEZONE || "America/Sao_Paulo";
 const HEADLESS = process.env.HEADLESS !== "false";
 
-/** Disciplinas alvo (fallback por título) */
+/** 1) Lista de títulos alvo para fallback por título (separados por vírgula) */
 const COURSE_TITLES = (process.env.COURSE_TITLES || "")
   .split(",")
   .map(s => s.trim())
   .filter(Boolean);
+
+/** 2) Mapeamento título → URL (duas formas):
+ *    a) COURSE_LINKS_JSON='[{"title":"Matemática e Lógica","url":"https://..."}]'
+ *    b) COURSE_LINKS='Matemática e Lógica|https://...;Outra|https://...'
+ */
+function parseCourseLinks() {
+  const links = {};
+  const j = process.env.COURSE_LINKS_JSON;
+  if (j) {
+    try {
+      const arr = JSON.parse(j);
+      for (const it of arr) {
+        if (it && it.title && it.url) links[it.title.trim().toLowerCase()] = it.url.trim();
+      }
+    } catch (e) {
+      console.warn("⚠️ COURSE_LINKS_JSON inválido:", e.message);
+    }
+  }
+  const s = process.env.COURSE_LINKS;
+  if (s) {
+    for (const pair of s.split(";")) {
+      const [title, url] = pair.split("|").map(x => (x || "").trim());
+      if (title && url) links[title.toLowerCase()] = url;
+    }
+  }
+  return links;
+}
+const COURSE_LINKS = parseCourseLinks();
 
 /** Local do Chrome baixado no build (Render) */
 const PUP_CACHE = process.env.PUPPETEER_CACHE_DIR || path.join(process.cwd(), ".puppeteer");
 
 /* =============== Utils =============== */
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const norm = (s) => (s || "").toString().normalize("NFD").replace(/\p{Diacritic}/gu, "").toLowerCase();
 
 /* ================= Cookies opcionais ================= */
 if (COOKIES_BASE64) {
@@ -120,7 +152,6 @@ async function clickAndWaitSPA(page, element, timeout = 10000) {
   const oldUrl = page.url();
   try { await element.evaluate(el => el.scrollIntoView({ block: "center" })); } catch {}
   await element.click({ delay: 50 });
-
   const start = Date.now();
   while (Date.now() - start < timeout) {
     if (page.url() !== oldUrl) return true;
@@ -288,6 +319,34 @@ async function getOpenCourseButtons(page) {
   return uniq;
 }
 
+/* ====== Fallback por URL (título → URL no .env) ====== */
+function lookupDisciplineUrlByTitle(title) {
+  if (!title) return null;
+  const key = title.trim().toLowerCase();
+  if (COURSE_LINKS[key]) return COURSE_LINKS[key];
+
+  // tentativa por normalização sem acentos (caso chaves venham normalizadas)
+  const entries = Object.entries(COURSE_LINKS);
+  const wanted = norm(title);
+  for (const [k, url] of entries) {
+    if (norm(k) === wanted) return url;
+  }
+  return null;
+}
+async function openDisciplineByUrl(page, title) {
+  const url = lookupDisciplineUrlByTitle(title);
+  if (!url) return false;
+  console.log(`↪️ Abrindo por URL mapeada (${title}): ${url}`);
+  const oldUrl = page.url();
+  await page.goto(url, { waitUntil: "domcontentloaded" });
+  // considera OK se mudou a URL ou se o layout do grid sumiu
+  const ok = (page.url() !== oldUrl) || await page.evaluate(() => {
+    const t = (document.body.innerText || "").toLowerCase();
+    return !(t.includes("minhas disciplinas") || t.includes("continue de onde parou"));
+  }).catch(() => false);
+  return !!ok;
+}
+
 /* ====== Fallback por título: rolagem + XPath translate + scanner ====== */
 async function openDisciplineByTitle(page, title) {
   await page.goto(COURSE_URL, { waitUntil: "networkidle2" });
@@ -396,7 +455,7 @@ async function openDisciplineByTitle(page, title) {
     }, title);
   };
 
-  // Espera o título estar no DOM (sem acentos)
+  // Espera o título estar no DOM (sem acentos) — só como tentativa auxiliar
   await page.waitForFunction(
     (t) => {
       const n = s => s.normalize("NFD").replace(/\p{Diacritic}/gu, "").toLowerCase();
@@ -471,30 +530,49 @@ async function processAllDisciplines(page, maxDisciplines = 12) {
   const btns = await getOpenCourseButtons(page);
   const total = Math.min(maxDisciplines, btns.length);
 
-  if (!total && COURSE_TITLES.length) {
-    console.log("ℹ️ Nenhum botão detectado — usando fallback por TÍTULO…");
-    for (const title of COURSE_TITLES) {
-      console.log(`\n=== 🎯 Tentando abrir por título: ${title} ===`);
-      const opened = await openDisciplineByTitle(page, title);
-      if (!opened) { console.log(`↷ Não consegui abrir "${title}". Pulando…`); continue; }
+  // 1) há botões no grid
+  if (total) {
+    console.log(`📦 Detectados ${btns.length} cards • Processando até ${total}.`);
+    for (let i = 0; i < total; i++) {
+      console.log(`\n=== 📚 Disciplina ${i + 1}/${total} ===`);
+      const opened = await openDisciplineByIndex(page, i);
+      if (!opened) { console.log(`↷ Clique não abriu a disciplina ${i + 1}. Pulando…`); continue; }
       try { await processSingleDiscipline(page, 5); } catch (e) { console.warn("⚠️ Erro na disciplina:", e.message); }
       try { await gotoHome(page); } catch {}
     }
-    console.log("\n✅ Varredura concluída (fallback por título).");
+    console.log("\n✅ Varredura concluída.");
     return;
   }
 
-  if (!total) { console.log("ℹ️ Nenhum botão de abrir disciplina encontrado no grid."); return; }
+  // 2) sem botões: tenta fallback por TÍTULO
+  if (COURSE_TITLES.length) {
+    console.log("ℹ️ Nenhum botão detectado — usando fallback por TÍTULO…");
+    for (const rawTitle of COURSE_TITLES) {
+      const title = rawTitle.trim();
+      console.log(`\n=== 🎯 Tentando abrir por título: ${title} ===`);
 
-  console.log(`📦 Detectados ${btns.length} cards • Processando até ${total}.`);
-  for (let i = 0; i < total; i++) {
-    console.log(`\n=== 📚 Disciplina ${i + 1}/${total} ===`);
-    const opened = await openDisciplineByIndex(page, i);
-    if (!opened) { console.log(`↷ Clique não abriu a disciplina ${i + 1}. Pulando…`); continue; }
-    try { await processSingleDiscipline(page, 5); } catch (e) { console.warn("⚠️ Erro na disciplina:", e.message); }
-    try { await gotoHome(page); } catch {}
+      // 2a) antes de heurísticas, se existir URL mapeada, usa direto:
+      const urlOk = await openDisciplineByUrl(page, title);
+      if (urlOk) {
+        try { await processSingleDiscipline(page, 5); } catch (e) { console.warn("⚠️ Erro na disciplina:", e.message); }
+        try { await gotoHome(page); } catch {}
+        continue;
+      }
+
+      // 2b) tenta abrir por título (DOM)
+      const opened = await openDisciplineByTitle(page, title);
+      if (!opened) {
+        console.log(`↷ Não consegui abrir "${title}". Pulando…`);
+        continue;
+      }
+      try { await processSingleDiscipline(page, 5); } catch (e) { console.warn("⚠️ Erro na disciplina:", e.message); }
+      try { await gotoHome(page); } catch {}
+    }
+    console.log("\n✅ Varredura concluída (fallback por título/URL).");
+    return;
   }
-  console.log("\n✅ Varredura concluída.");
+
+  console.log("ℹ️ Nenhum botão de abrir disciplina encontrado no grid e sem títulos configurados.");
 }
 
 /* ================== Execução/Scheduler ================== */
