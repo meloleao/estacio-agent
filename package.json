@@ -1,11 +1,15 @@
 {
   "name": "estacio-agent",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "type": "module",
   "scripts": {
     "start": "node index.js",
-    "postinstall": "puppeteer browsers install chrome --cache-dir=.puppeteer",
-    "render-build": "PUPPETEER_CACHE_DIR=.puppeteer npm install && npx puppeteer browsers install chrome --cache-dir=.puppeteer"
+
+    // Build especial para o Render: usa caminho ABSOLUTO
+    "render-build": "PUPPETEER_CACHE_DIR=/opt/render/project/src/.puppeteer npm install && npx puppeteer browsers install chrome --cache-dir=/opt/render/project/src/.puppeteer",
+
+    // Mantém o postinstall para execuções locais; também com caminho ABSOLUTO no Render
+    "postinstall": "npx puppeteer browsers install chrome --cache-dir=/opt/render/project/src/.puppeteer || npx puppeteer browsers install chrome --cache-dir=$(pwd)/.puppeteer"
   },
   "dependencies": {
     "puppeteer": "^23.0.0",
