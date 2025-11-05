@@ -242,56 +242,110 @@ async function gotoHome(page) {
   await page.goto(COURSE_URL, { waitUntil: "networkidle2" });
 }
 
-async function openCourseByIndex(page, courseIndex) {
-  await gotoHome(page);
-
-  const cards = await page.$$(
+/** Detecta e retorna ElementHandles dos cards do grid */
+async function getCourseCards(page) {
+  // Estratégia A: cards típicos
+  let cards = await page.$$(
     "article, div[class*='card']:not([class*='small']), div[data-testid*='card']"
   );
-  if (!cards.length || courseIndex >= cards.length) return false;
+  if (cards.length) return cards;
+
+  // Estratégia B (XPath): bloco com “Digital (Ead)” e pelo menos um botão
+  const xpathB = "//*[contains(normalize-space(.), 'Digital (Ead)') and .//button]";
+  cards = await page.$x(xpathB);
+  if (cards.length) return cards;
+
+  // Estratégia C: derivar container a partir dos botões (pega o “card” pai)
+  const buttons = await page.$$("button");
+  const containerHandles = [];
+  for (const btn of buttons) {
+    try {
+      const container = await btn.evaluateHandle((el) => {
+        function findCard(node) {
+          while (node && node !== document.body) {
+            const cls = (node.getAttribute && node.getAttribute("class")) || "";
+            const text = (node.innerText || "").toLowerCase();
+            const hasProgress = /(\d+\s*\/\s*\d+)/.test(text) || text.includes("%");
+            const maybeCard =
+              node.tagName === "ARTICLE" ||
+              (cls && /card|mui|paper|container|content|grid/i.test(cls));
+            if (maybeCard && hasProgress) return node;
+            node = node.parentElement;
+          }
+          return null;
+        }
+        return findCard(el);
+      });
+      if (container) containerHandles.push(container);
+    } catch {}
+  }
+  // Remover duplicados (por referência real)
+  const uniq = [];
+  for (const h of containerHandles) {
+    let isDup = false;
+    for (const u of uniq) {
+      // compara o elemento do DOM
+      /* eslint-disable no-await-in-loop */
+      const [a, b] = await Promise.all([u.evaluate(n => n), h.evaluate(n => n)]).catch(() => [null, null]);
+      if (a === b) { isDup = true; break; }
+      /* eslint-enable */
+    }
+    if (!isDup) uniq.push(h);
+  }
+  if (uniq.length) return uniq;
+
+  // Estratégia D: bloco que tenha botão e porcentagem ou "0/"
+  const xpathD = "//*[.//button and (contains(., '%') or contains(., '0/'))]";
+  cards = await page.$x(xpathD);
+  return cards;
+}
+
+/** Abre a disciplina do grid pelo índice (clicando no “botão de setinha” do card) */
+async function openCourseByIndex(page, courseIndex) {
+  await gotoHome(page);
+  const cards = await getCourseCards(page);
+
+  if (!cards.length || courseIndex >= cards.length) {
+    console.log("⚠️ Nenhum card detectado ou índice fora do range.");
+    return false;
+  }
 
   const card = cards[courseIndex];
 
-  // pular 100%
+  // Heurística: dentro do card, clique no **último botão** (normalmente é a setinha).
   try {
-    const percentEl = await card.$("div:has-text('%'), span:has-text('%')");
-    if (percentEl) {
-      const txt = (await percentEl.evaluate(el => el.textContent)).trim();
-      const m = txt.match(/(\d{1,3})\s*%/);
-      if (m && Number(m[1]) >= 100) {
-        console.log(`↷ Pulando disciplina ${courseIndex + 1} (100%).`);
-        return false;
-      }
+    const innerButtons = await card.$$("button");
+    if (innerButtons.length) {
+      const btn = innerButtons[innerButtons.length - 1];
+      await Promise.all([
+        page.waitForNavigation({ waitUntil: "networkidle2" }).catch(() => {}),
+        btn.click(),
+      ]);
+      return true;
     }
   } catch {}
 
-  // cliques possíveis
-  const inside = [
-    "button[aria-label*='Ir' i]",
-    "button[aria-label*='Continuar' i]",
-    "a[href]",
-    "button"
-  ];
-  for (const sel of inside) {
-    const el = await card.$(sel);
-    if (el) {
-      try {
-        await Promise.all([
-          page.waitForNavigation({ waitUntil: "networkidle2" }).catch(() => {}),
-          el.click()
-        ]);
-        return true;
-      } catch {}
+  // fallback: clicar em algum link do card
+  try {
+    const link = await card.$("a[href]");
+    if (link) {
+      await Promise.all([
+        page.waitForNavigation({ waitUntil: "networkidle2" }).catch(() => {}),
+        link.click(),
+      ]);
+      return true;
     }
-  }
-  // fallback: clicar no card
+  } catch {}
+
+  // último fallback: clicar no próprio card
   try {
     await Promise.all([
       page.waitForNavigation({ waitUntil: "networkidle2" }).catch(() => {}),
-      card.click()
+      card.click(),
     ]);
     return true;
   } catch {}
+
   return false;
 }
 
@@ -339,20 +393,33 @@ async function processAllDisciplines(page, maxDisciplines = 12) {
   console.log("🗂  Varredura das disciplinas…");
   await gotoHome(page);
 
-  const count = (await page.$$(
-    "article, div[class*='card']:not([class*='small']), div[data-testid*='card']"
-  )).length;
+  const cards = await getCourseCards(page);
+  const total = Math.min(maxDisciplines, cards.length);
 
-  const total = Math.min(maxDisciplines, Math.max(count, 0));
-  if (!total) { console.log("ℹ️ Nenhuma disciplina no grid."); return; }
+  if (!total) {
+    console.log("ℹ️ Nenhuma disciplina no grid (pelos seletores atuais).");
+    return;
+  }
+
+  console.log(`📦 Detectados ${cards.length} cards • Processando até ${total}.`);
 
   for (let i = 0; i < total; i++) {
     console.log(`\n=== 📚 Disciplina ${i + 1}/${total} ===`);
     const opened = await openCourseByIndex(page, i);
-    if (!opened) { console.log(`↷ Não consegui abrir a disciplina ${i + 1}. Pulando…`); continue; }
-    try { await processSingleDiscipline(page, 5); } catch (e) { console.warn("⚠️ Erro na disciplina:", e.message); }
+    if (!opened) {
+      console.log(`↷ Não consegui abrir a disciplina ${i + 1}. Pulando…`);
+      continue;
+    }
+
+    try {
+      await processSingleDiscipline(page, 5); // até 5 itens por disciplina
+    } catch (e) {
+      console.warn("⚠️ Erro na disciplina:", e.message);
+    }
+
     try { await gotoHome(page); } catch {}
   }
+
   console.log("\n✅ Varredura concluída.");
 }
 
